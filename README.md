@@ -1,4 +1,4 @@
-# @local/dsh-thoughtdag-file-open
+# dsh-thoughtdag-file-open
 
 让 ThoughtDAG 画布里的**文件链接**在**当前页面弹窗**里打开，而不是把画布 iframe
 导航到 `/thoughtdag/docs/...` 这种画布渲染不了的地址；也不切换主视图、不跳页。

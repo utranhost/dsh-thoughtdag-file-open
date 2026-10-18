@@ -1,5 +1,5 @@
 # The Host half registers the authenticated save route the in-page editor calls.
 # Keep the row id stable; the bundle name pairs with package.json.
 - insert:
-    - id: thoughtdag-file-open
-      name: '@local/thoughtdag-file-open'
+    - id: dsh-thoughtdag-file-open
+      name: 'dsh-thoughtdag-file-open'
