@@ -1,0 +1,6 @@
+# The Host half is an empty apply: this bundle exists so the Loader holds a row
+# the browser module system can serve `client.js` for. Keep everything the
+# plugin does in the Client module (it owns no Host resources).
+- insert:
+    - id: thoughtdag-file-open
+      name: '@local/dsh-thoughtdag-file-open'

@@ -1,0 +1,5 @@
+# Build artifacts are not versioned: rebuild with `npm pack` (the README's
+# "修改与重新安装" section) and install the produced tarball through
+# plugin_manager. The file stays on disk for the current profile install.
+*.tgz
+node_modules/
