@@ -423,6 +423,25 @@ async function run() {
     assert.ok(classes.includes('dsh-tdfi-dirty'))
   })
 
+  await check('maximize toggles the dialog class and resets when the dialog closes', async () => {
+    const harness = createHarness({
+      fetch: async () => jsonResponse({ ok: true, editing: true }),
+      files: { '/project/docs/guide.md': '# Guide\n' },
+    })
+    await openFiles(harness, ['/project/docs/guide.md'])
+    assert.equal(harness.debug().state().maximized, false)
+    harness.debug().toggleMaximize()
+    assert.equal(harness.debug().state().maximized, true)
+    assert.ok(harness.overlayClasses().some((name) => typeof name === 'string' && name.includes('dsh-tdfi-maximized')))
+    harness.debug().toggleMaximize()
+    assert.equal(harness.debug().state().maximized, false)
+    assert.ok(!harness.overlayClasses().some((name) => typeof name === 'string' && name.includes('dsh-tdfi-maximized')))
+    harness.debug().toggleMaximize()
+    harness.debug().forceCloseAll()
+    assert.equal(harness.debug().state().maximized, false)
+    assert.equal(harness.debug().state().tabs.length, 0)
+  })
+
   await check('the unsaved confirmation renders its card over the body', async () => {
     const files = new Map([['/project/docs/guide.md', '# Guide\n']])
     const versions = new Map([['/project/docs/guide.md', 'v1']])

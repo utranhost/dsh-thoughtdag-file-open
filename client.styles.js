@@ -489,6 +489,16 @@ window.__ModuleLoader__.load({
   .dsh-tdfi-tab-close,
   .dsh-tdfi-iconbtn{transition:none}
 }
+
+/* Maximized: fill the frame's padding box (the Modal layer already explains
+   its insets through these two variables), keeping a slim 12-24px margin so
+   the surface still reads as a DSH panel rather than a bare fullscreen div. */
+.dsh-tdfi-dialog.dsh-tdfi-maximized.dsh-tdfi-maximized{
+  width:calc(100vw - 48px);
+  height:calc(100vh - 2 * max(24px, var(--dsh-frame-overlay-top, 24px)));
+  max-height:none;
+  border-radius:var(--dsw-radius-md);
+}
 `
 
     module.exports = { CSS }

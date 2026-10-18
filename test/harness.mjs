@@ -238,6 +238,8 @@ export function createHarness(options = {}) {
     IconCloseOutlineRegular: () => null,
     IconEditOutlineRegular: () => null,
     IconRightUpOutlineRegular: () => null,
+    IconFullscreenOutlineRegular: () => null,
+    IconCompactOutlineRegular: () => null,
     languageForPath: () => 'javascript',
     fileSizeText: (bytes) => `${String(bytes)} B`,
   }

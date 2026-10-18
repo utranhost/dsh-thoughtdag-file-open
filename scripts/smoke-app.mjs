@@ -155,6 +155,15 @@ try {
 }
 ok('multi-cursor enabled (allowMultipleSelections facet + state ranges)')
 
+// Maximize fills the viewport; restore returns to the centered card.
+harness.debug().toggleMaximize()
+await sleep(120)
+assert(window.document.querySelector('.dsh-tdfi-dialog.dsh-tdfi-maximized') !== null, 'maximize adds the dialog class')
+harness.debug().toggleMaximize()
+await sleep(120)
+assert(window.document.querySelector('.dsh-tdfi-dialog.dsh-tdfi-maximized') === null, 'restore removes the dialog class')
+ok('maximize toggles the dialog size mode')
+
 // A real edit marks the tab dirty and reaches the entry's draft state.
 const before = view.state.doc.toString()
 view.dispatch({ changes: { from: 0, insert: '// edited\n' } })

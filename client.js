@@ -49,6 +49,8 @@ window.__ModuleLoader__.load({
       IconCloseOutlineRegular,
       IconEditOutlineRegular,
       IconRightUpOutlineRegular,
+      IconFullscreenOutlineRegular,
+      IconCompactOutlineRegular,
       languageForPath,
       fileSizeText,
     } = primitives
@@ -117,6 +119,8 @@ window.__ModuleLoader__.load({
       'IconCloseOutlineRegular',
       'IconEditOutlineRegular',
       'IconRightUpOutlineRegular',
+      'IconFullscreenOutlineRegular',
+      'IconCompactOutlineRegular',
       'languageForPath',
       'fileSizeText',
     ]
@@ -152,6 +156,9 @@ window.__ModuleLoader__.load({
               error: '打开这个文件时出错。',
               line: '第 {line} 行',
               openInWindow: '在文件窗口打开',
+              maximize: '最大化',
+              restore: '还原',
+              maximizeHint: 'Ctrl/⌘ + Shift + M',
               edit: '编辑',
               preview: '预览',
               save: '保存',
@@ -200,6 +207,9 @@ window.__ModuleLoader__.load({
               error: 'Opening this file failed.',
               line: 'Line {line}',
               openInWindow: 'Open in document window',
+              maximize: 'Maximize',
+              restore: 'Restore',
+              maximizeHint: 'Ctrl/⌘ + Shift + M',
               edit: 'Edit',
               preview: 'Preview',
               save: 'Save',
@@ -291,7 +301,7 @@ window.__ModuleLoader__.load({
       // ── view state ────────────────────────────────────────────────────────
       // One immutable snapshot per change, so React's external-store comparison
       // re-renders exactly once per action.
-      let view = { tabs: [], activeId: null, confirm: null }
+      let view = { tabs: [], activeId: null, confirm: null, maximized: false }
       const viewListeners = new Set()
       const controllers = new Map()
       // The mounted editor's imperative face (undefined when no editor is up).
@@ -373,6 +383,11 @@ window.__ModuleLoader__.load({
 
       function isCurrent(id) {
         return findTab(id) !== null
+      }
+
+      /** Fill the viewport (or return to the roomy centered card). */
+      function toggleMaximized() {
+        setView({ maximized: view.maximized !== true })
       }
 
       function showToast(text) {
@@ -580,7 +595,7 @@ window.__ModuleLoader__.load({
           }
         }
         controllers.clear()
-        setView({ tabs: [], activeId: null, confirm: null })
+        setView({ tabs: [], activeId: null, confirm: null, maximized: false })
       }
 
       function requestCloseDialog() {
@@ -964,6 +979,21 @@ window.__ModuleLoader__.load({
           React.createElement(
             'button',
             {
+              key: 'maximize',
+              type: 'button',
+              className: 'dsh-tdfi-iconbtn',
+              title: `${t(view.maximized === true ? 'restore' : 'maximize')} · ${t('maximizeHint')}`,
+              'aria-label': t(view.maximized === true ? 'restore' : 'maximize'),
+              'data-maximized': view.maximized === true ? 'true' : undefined,
+              onClick: toggleMaximized,
+            },
+            React.createElement(view.maximized === true ? IconCompactOutlineRegular : IconFullscreenOutlineRegular, { size: 15 }),
+          ),
+        )
+        nodes.push(
+          React.createElement(
+            'button',
+            {
               key: 'window',
               type: 'button',
               className: 'dsh-tdfi-iconbtn',
@@ -1150,6 +1180,12 @@ window.__ModuleLoader__.load({
           if (current !== null) setMode(current.id, current.mode === 'edit' ? 'preview' : 'edit')
           return
         }
+        if (modifier && event.shiftKey === true && (event.key === 'm' || event.key === 'M')) {
+          event.preventDefault()
+          event.stopPropagation()
+          toggleMaximized()
+          return
+        }
         if (event.key === 'Escape' && view.confirm !== null) {
           event.preventDefault()
           event.stopPropagation()
@@ -1189,7 +1225,7 @@ window.__ModuleLoader__.load({
             headless: true,
             onClose: requestCloseDialog,
             title: active === null ? t('title') : active.fileName,
-            className: 'dsh-tdfi-dialog',
+            className: current.maximized === true ? 'dsh-tdfi-dialog dsh-tdfi-maximized' : 'dsh-tdfi-dialog',
             backdropBlur: false,
           },
           React.createElement(
@@ -1357,6 +1393,10 @@ window.__ModuleLoader__.load({
           confirmSave: () => saveConfirm(),
           confirmCancel: () => cancelConfirm(),
           editingSupported: () => editingSupported,
+          toggleMaximize: () => {
+            toggleMaximized()
+            return view.maximized === true
+          },
           editorDiagnostics: () => ({
             ...editorInfo,
             ...(editorApi?.diagnostics?.() ?? {}),
