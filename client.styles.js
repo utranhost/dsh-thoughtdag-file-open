@@ -202,6 +202,13 @@ window.__ModuleLoader__.load({
   line-height:18px;
   white-space:nowrap;
 }
+/* The open-in-window action sits at the end of the path row, one step smaller
+   than the header icon buttons so it aligns with the 18px pills. */
+.dsh-tdfi-meta-action{
+  width:24px;
+  height:24px;
+  margin:0 -6px 0 2px;
+}
 
 /* ── body ────────────────────────────────────────────────────────────────── */
 .dsh-tdfi-body{

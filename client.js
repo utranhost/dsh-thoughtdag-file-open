@@ -50,10 +50,36 @@ window.__ModuleLoader__.load({
       IconEditOutlineRegular,
       IconRightUpOutlineRegular,
       IconFullscreenOutlineRegular,
-      IconCompactOutlineRegular,
       languageForPath,
       fileSizeText,
     } = primitives
+
+    /**
+     * Exit-fullscreen glyph for the maximized state: four corner brackets
+     * contracting inward, drawn with the same 16px/1px stroke language as the
+     * DSH icons (the shipped set has no restore glyph).
+     */
+    function RestoreIcon({ size = 15 }) {
+      return React.createElement(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 16 16',
+          fill: 'none',
+          xmlns: 'http://www.w3.org/2000/svg',
+          'aria-hidden': 'true',
+          stroke: 'currentColor',
+          strokeWidth: 1,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        },
+        React.createElement('path', { d: 'M5.333 2v2A1.333 1.333 0 0 1 4 5.333H2' }),
+        React.createElement('path', { d: 'M14 5.333h-2A1.333 1.333 0 0 1 10.667 4V2' }),
+        React.createElement('path', { d: 'M2 10.667h2A1.333 1.333 0 0 1 5.333 12v2' }),
+        React.createElement('path', { d: 'M10.667 14v-2A1.333 1.333 0 0 1 12 10.667h2' }),
+      )
+    }
 
     // ── chunks ──────────────────────────────────────────────────────────────
     let chunks = null
@@ -120,7 +146,6 @@ window.__ModuleLoader__.load({
       'IconEditOutlineRegular',
       'IconRightUpOutlineRegular',
       'IconFullscreenOutlineRegular',
-      'IconCompactOutlineRegular',
       'languageForPath',
       'fileSizeText',
     ]
@@ -987,23 +1012,7 @@ window.__ModuleLoader__.load({
               'data-maximized': view.maximized === true ? 'true' : undefined,
               onClick: toggleMaximized,
             },
-            React.createElement(view.maximized === true ? IconCompactOutlineRegular : IconFullscreenOutlineRegular, { size: 15 }),
-          ),
-        )
-        nodes.push(
-          React.createElement(
-            'button',
-            {
-              key: 'window',
-              type: 'button',
-              className: 'dsh-tdfi-iconbtn',
-              title: t('openInWindow'),
-              'aria-label': t('openInWindow'),
-              onClick: () => {
-                openInWindow(tab).catch(() => showToast(t('error')))
-              },
-            },
-            React.createElement(IconRightUpOutlineRegular, { size: 15 }),
+            React.createElement(view.maximized === true ? RestoreIcon : IconFullscreenOutlineRegular, { size: 15 }),
           ),
         )
         nodes.push(React.createElement('span', { key: 'divider', className: 'dsh-tdfi-divider' }))
@@ -1038,6 +1047,22 @@ window.__ModuleLoader__.load({
         if (tab.truncated === true) {
           children.push(React.createElement('span', { key: 'cut', className: 'dsh-tdfi-pill' }, t('truncated')))
         }
+        children.push(
+          React.createElement(
+            'button',
+            {
+              key: 'window',
+              type: 'button',
+              className: 'dsh-tdfi-iconbtn dsh-tdfi-meta-action',
+              title: t('openInWindow'),
+              'aria-label': t('openInWindow'),
+              onClick: () => {
+                openInWindow(tab).catch(() => showToast(t('error')))
+              },
+            },
+            React.createElement(IconRightUpOutlineRegular, { size: 14 }),
+          ),
+        )
         return React.createElement('div', { className: 'dsh-tdfi-meta' }, children)
       }
 

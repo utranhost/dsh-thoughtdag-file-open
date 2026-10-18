@@ -127,6 +127,9 @@ assert(styleText.includes('--shiki-token-keyword'), 'syntax palette in generated
 const tokenSpans = window.document.querySelectorAll('.cm-line span')
 assert(tokenSpans.length > 0, 'syntax-highlighted token spans exist')
 ok('edit mode mounts CodeMirror with gutter, content and syntax spans')
+assert(window.document.querySelector('.dsh-tdfi-meta button.dsh-tdfi-meta-action') !== null, 'open-in-window moved into the path row')
+assert(window.document.querySelector('.dsh-tdfi-head .dsh-tdfi-actions button[aria-label=openInWindow]') === null, 'open-in-window left the header action row')
+ok('open-in-window lives in the path row')
 
 const cm = await harness.chunk('client.codemirror.js')
 const view = cm.EditorView.findFromDOM(editorElement)
