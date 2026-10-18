@@ -1,5 +1,5 @@
 /**
- * Host half of @local/thoughtdag-file-open.
+ * Host half of dsh-thoughtdag-file-open.
  *
  * The viewer itself is a Client plugin: it intercepts file links inside the
  * ThoughtDAG canvas iframe and renders them in an in-page, tabbed dialog. This
@@ -36,7 +36,7 @@ export const SAVE_ROUTE = '/api/thoughtdag-file-open.save'
 export const MAX_CONTENT_BYTES = 8 * 1024 * 1024
 
 /** Stable plugin name (matches the Loader row and the Client module id). */
-export const name = '@local/thoughtdag-file-open'
+export const name = 'dsh-thoughtdag-file-open'
 /** Host services this plugin cannot work without. */
 export const inject = ['connection', 'fs', 'sessions', 'sandboxPolicy']
 

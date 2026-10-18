@@ -1,4 +1,4 @@
-// @local/thoughtdag-file-open — chunk: the viewer stylesheet.
+// dsh-thoughtdag-file-open — chunk: the viewer stylesheet.
 //
 // Every color, radius, shadow and font comes from a DSH theme token, and the
 // dialog keeps the Modal primitive's own animation, mask and focus handling:
@@ -6,7 +6,7 @@
 // header/footer gap) so it reads as a native DSH surface rather than a custom
 // window.
 window.__ModuleLoader__.load({
-  id: '@local/thoughtdag-file-open',
+  id: 'dsh-thoughtdag-file-open',
   chunk: 'client.styles.js',
   factory: () => {
     const module = { exports: {} }

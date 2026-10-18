@@ -1,10 +1,10 @@
-// @local/thoughtdag-file-open — chunk: pure path / link / file-kind helpers.
+// dsh-thoughtdag-file-open — chunk: pure path / link / file-kind helpers.
 //
 // This chunk has no React and no Host access: it is the vocabulary the entry
 // module and the other chunks share. Loading it as a package-local chunk keeps
 // the entry bundle small and keeps the path rules in one testable file.
 window.__ModuleLoader__.load({
-  id: '@local/thoughtdag-file-open',
+  id: 'dsh-thoughtdag-file-open',
   chunk: 'client.util.js',
   factory: () => {
     const module = { exports: {} }

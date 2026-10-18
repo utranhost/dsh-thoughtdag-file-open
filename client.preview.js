@@ -1,11 +1,11 @@
-// @local/thoughtdag-file-open — chunk: read-only preview bodies.
+// dsh-thoughtdag-file-open — chunk: read-only preview bodies.
 //
 // Each view is drawn with the same DSH primitives the chat uses, so a Markdown
 // document, a code buffer, an image or a PDF looks like it belongs to the
 // Harness. Binary and Office previews keep the "open in the document window"
 // fallback the previous version offered.
 window.__ModuleLoader__.load({
-  id: '@local/thoughtdag-file-open',
+  id: 'dsh-thoughtdag-file-open',
   chunk: 'client.preview.js',
   factory: (require) => {
     const React = require('react')

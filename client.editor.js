@@ -1,4 +1,4 @@
-// @local/thoughtdag-file-open — chunk: the in-place editor.
+// dsh-thoughtdag-file-open — chunk: the in-place editor.
 //
 // The body is a vendored CodeMirror 6 bundle (package root
 // `client.codemirror.js`, loaded lazily on the first Edit click) themed with
@@ -13,7 +13,7 @@
 // keystrokes. External content (a conflict reload) arrives through the `text`
 // prop and is applied without echoing drafts back down.
 window.__ModuleLoader__.load({
-  id: '@local/thoughtdag-file-open',
+  id: 'dsh-thoughtdag-file-open',
   chunk: 'client.editor.js',
   factory: (require) => {
     const React = require('react')

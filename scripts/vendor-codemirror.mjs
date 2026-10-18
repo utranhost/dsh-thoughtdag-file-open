@@ -25,7 +25,7 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const VENDOR = join(ROOT, 'vendor', 'codemirror')
 const OUTPUT = join(ROOT, 'client.codemirror.js')
 const LICENSES = join(VENDOR, 'LICENSES.md')
-const PLUGIN_ID = '@local/thoughtdag-file-open'
+const PLUGIN_ID = 'dsh-thoughtdag-file-open'
 const CHUNK_NAME = 'client.codemirror.js'
 const GLOBAL_NAME = '__VENDORED_CODEMIRROR'
 

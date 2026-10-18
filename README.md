@@ -132,14 +132,17 @@ Markdown（GFM/TeX）、代码高亮（Shiki）与 Modal/Toast 必须和聊天�
 ## 安装状态
 
 - 已作为 profile bundle 安装进 `web` profile：
-  - 包 `@local/thoughtdag-file-open`（目录名是 `dsh-thoughtdag-file-open`），版本
-    `3.0.0`，行 id `thoughtdag-file-open`；
+  - 包 `dsh-thoughtdag-file-open`（同名目录），版本
+    `3.0.0`，行 id `dsh-thoughtdag-file-open`；
   - profile 依赖是指向本目录的 `link:`，所以**修改本目录的客户端文件即热更新**；
   - 旧的 `@local/dsh-thoughtdag-file-open@2.2.0` bundle 已移除（其 profile 依赖指向
     一个已不存在的 tgz，会阻塞 pnpm 安装）。
-- 包名与目录名不同是有意为之：DSH 的 Loader 按**模块说明符**缓存 Host 模块代际，
-  同一个包名在进程内不会重新 import。升级需要让 Host 半边（保存路由）立刻生效时，
-  换一个新包名（以及新的入口文件名 `host.js`）即可避免重启 dsh；纯客户端改动不需要。
+- 三条标识必须始终一致：包名（`package.json` 的 `name`）、Loader 行 `name`
+  （`cordis.patch.yml`）、客户端模块 id（`client*.js` 里的 `__ModuleLoader__.load({ id })`）。
+  只改其中一处，另外两处就解析失败——客户端半边根本不会注册。
+- 改名即等于换身份：DSH 的 Loader 按**模块说明符**缓存 Host 模块代际，同一个包名在
+  进程内不会重新 import，所以换名后需要重新安装该 bundle（profile 的依赖键与
+  `dsh.profile.bundles` 也要同步改），Host 半边才会立即生效；纯客户端改动不需要。
 - 客户端模块 `immediately: true`，`external` 只声明 `@deepseek-ai/dsh-client-ui-primitives`。
 - 页面若未自动更新，刷新一次（F5）。
 

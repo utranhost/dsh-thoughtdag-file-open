@@ -1,4 +1,4 @@
-// @local/thoughtdag-file-open — Client entry.
+// dsh-thoughtdag-file-open — Client entry.
 //
 // ThoughtDAG's canvas renders Markdown links as ordinary anchors inside its
 // same-origin iframe: a relative href such as `docs/product/status.md` resolves
@@ -27,13 +27,13 @@
 // This entry owns the tab state, the canvas click bridge, the dialog chrome,
 // the edit/save/conflict flow, and the locale dictionaries.
 window.__ModuleLoader__.load({
-  id: '@local/thoughtdag-file-open',
+  id: 'dsh-thoughtdag-file-open',
   factory(require) {
     const React = require('react')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const module = { exports: {} }
 
-    const NS = '@local/thoughtdag-file-open'
+    const NS = 'dsh-thoughtdag-file-open'
     const TOAST_MS = 6000
     const OPEN_TIMEOUT_MS = 3000
     // The code view highlights asynchronously, so the jump retries as DOM settles.

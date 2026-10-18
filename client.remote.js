@@ -1,11 +1,11 @@
-// @local/thoughtdag-file-open — chunk: Host file access.
+// dsh-thoughtdag-file-open — chunk: Host file access.
 //
 // Everything here talks to the Host half or to the DSH Remote faces the entry
 // module injected: workspace-file reads, the browser bridge the ThoughtDAG host
 // half serves, the canvas's persisted project directories, and the save route
 // the Host half registers on the authenticated `/api` fence.
 window.__ModuleLoader__.load({
-  id: '@local/thoughtdag-file-open',
+  id: 'dsh-thoughtdag-file-open',
   chunk: 'client.remote.js',
   factory: () => {
     const module = { exports: {} }

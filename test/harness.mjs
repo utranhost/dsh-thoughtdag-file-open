@@ -1,4 +1,4 @@
-// Browser-free test harness for @local/thoughtdag-file-open.
+// Browser-free test harness for dsh-thoughtdag-file-open.
 //
 // The plugin is a client bundle: `client.js` registers a lazy factory and
 // loads package-local chunks with `require.async("./client.<name>.js")`. This
@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
-export const NS = '@local/thoughtdag-file-open'
+export const NS = 'dsh-thoughtdag-file-open'
 
 /** Locale translator stub: the tests assert behaviour, not copy. */
 function translate(key, params) {

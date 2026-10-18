@@ -1,11 +1,11 @@
-// @local/thoughtdag-file-open — chunk: the tab strip and the
+// dsh-thoughtdag-file-open — chunk: the tab strip and the
 // unsaved-changes confirmation card.
 //
 // Both are pure presentation: the entry module owns the tab state and passes
 // callbacks down, so this chunk can be tested and restyled without touching
 // the file-loading or Host-write paths.
 window.__ModuleLoader__.load({
-  id: '@local/thoughtdag-file-open',
+  id: 'dsh-thoughtdag-file-open',
   chunk: 'client.tabs.js',
   factory: (require) => {
     const React = require('react')
