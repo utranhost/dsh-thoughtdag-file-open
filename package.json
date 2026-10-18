@@ -1,18 +1,20 @@
 {
-  "name": "@local/dsh-thoughtdag-file-open",
-  "version": "2.2.0",
+  "name": "@local/thoughtdag-file-open",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
-  "description": "Open file links clicked inside the ThoughtDAG canvas in an in-page modal (Markdown, code, images, PDF, HTML, Office) with line targets, cross-platform paths, rendered with DSH UI primitives.",
+  "description": "Open file links clicked inside the ThoughtDAG canvas in a refined, multi-tab in-page viewer with an in-place editor, rendered with DSH UI primitives.",
   "exports": {
-    ".": "./index.js",
+    ".": "./host.js",
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "files": [
-    "index.js",
+    "host.js",
     "client.js",
-    "cordis.patch.yml"
+    "client.*.js",
+    "cordis.patch.yml",
+    "vendor/codemirror/LICENSES.md"
   ],
   "dsh": {
     "bundle": {

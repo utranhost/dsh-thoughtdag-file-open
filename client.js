@@ -1,669 +1,82 @@
-// @local/dsh-thoughtdag-file-open — Client half.
+// @local/thoughtdag-file-open — Client entry.
 //
 // ThoughtDAG's canvas renders Markdown links as ordinary anchors inside its
 // same-origin iframe: a relative href such as `docs/product/status.md` resolves
 // against `/thoughtdag/` and the canvas navigates to a URL the SPA cannot
-// render. This module keeps the click where it is and shows the file in an
-// in-page modal over the canvas, rendered with the harness's own UI primitives
-// (the same Markdown/code renderers the chat uses). Ordinary HTTP(S) links are
-// never touched.
+// render. This module keeps the click where it is and opens the file in an
+// in-page, multi-tab dialog over the canvas.
 //
-// It resolves the href to a real file through the harness, reads it through the
-// session-authorised workspace endpoint, and renders by kind: Markdown, code /
-// text, images, PDF, HTML (sandboxed), and Office documents (via the host's
-// Office→PDF conversion). Anything it cannot render falls back to a button that
-// opens the file in the harness's own document window.
+// The dialog has two modes per tab: a read-only preview drawn with the
+// Harness's own primitives (the same Markdown/code renderers the chat uses),
+// and an in-place editor. Editing is never the default: a tab opens in preview
+// and an explicit Edit button switches to the editor; Save writes through the
+// Host half's authenticated route with the file version the viewer read, so a
+// file changed by someone else raises a conflict banner instead of being
+// silently clobbered.
+//
+// The implementation is split into package-local dynamic chunks loaded with
+// `require.async("./client.<name>.js")`:
+//
+//   client.util.js     pure path / href / file-kind helpers
+//   client.remote.js   workspace reads, canvas-dir resolution, save route
+//   client.styles.js   the token-only stylesheet
+//   client.tabs.js     tab strip and unsaved-changes confirmation card
+//   client.preview.js  read-only Markdown/code/image/PDF/HTML/Office bodies
+//   client.editor.js   the monospace text editor with a line gutter
+//
+// This entry owns the tab state, the canvas click bridge, the dialog chrome,
+// the edit/save/conflict flow, and the locale dictionaries.
 window.__ModuleLoader__.load({
-  id: '@local/dsh-thoughtdag-file-open',
+  id: '@local/thoughtdag-file-open',
   factory(require) {
     const React = require('react')
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const module = { exports: {} }
 
-    const { Modal, Button, MarkdownText, MarkdownDelegateProvider, CodeBlock, PathLabel, FileTypeIcon, StateDot, languageForPath, fileSizeText, Toast } = primitives
-
-    const NS = '@local/dsh-thoughtdag-file-open'
-    const VERSION = '2.2.0'
+    const NS = '@local/thoughtdag-file-open'
     const TOAST_MS = 6000
-    const RESOLVE_TIMEOUT_MS = 4000
     const OPEN_TIMEOUT_MS = 3000
-    const MAX_STAT_SESSIONS = 24
-    const MAX_BASES = 32
-    const MAX_TEXT_PAGES = 6
-    // Keep the code viewer responsive: Shiki highlights the whole buffer.
-    const MAX_CODE_CHARS = 150000
-    const MAX_MARKDOWN_CHARS = 400000
-    // ── kinds this viewer renders ───────────────────────────────────────────
-    const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown', 'mdown', 'mkd', 'mkdn', 'mdwn'])
-    const IMAGE_MIME = {
-      png: 'image/png',
-      jpg: 'image/jpeg',
-      jpeg: 'image/jpeg',
-      gif: 'image/gif',
-      webp: 'image/webp',
-      bmp: 'image/bmp',
-      ico: 'image/x-icon',
-      svg: 'image/svg+xml',
-      avif: 'image/avif',
-      apng: 'image/apng',
-      tif: 'image/tiff',
-      tiff: 'image/tiff',
-    }
-    const PDF_EXTENSIONS = new Set(['pdf'])
-    const HTML_EXTENSIONS = new Set(['html', 'htm', 'xhtml'])
-    // Every target the host's office-to-pdf provider accepts.
-    const OFFICE_EXTENSIONS = new Set(['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'])
-    // Extension-less links are only taken over for names that are plainly files.
-    const BARE_FILE_NAMES = new Set(['dockerfile', 'containerfile', 'makefile', 'rakefile', 'gemfile', 'procfile', 'brewfile', 'license', 'licence', 'notice', 'copying', 'readme', 'changelog', 'authors', 'contributing', 'go.mod', 'go.sum', 'cargo.lock'])
-    const DIR_KEY = /(?:agentcwd|cwd|workingdir|workspacedir|basedir|rootdir|directory|folder|dir)$/i
+    // The code view highlights asynchronously, so the jump retries as DOM settles.
+    const LINE_SCROLL_DELAYS = [0, 160, 480, 1000, 1800]
 
-    // ── small path helpers ─────────────────────────────────────────────────
-    function encodeSegment(segment) {
-      return encodeURIComponent(segment).replace(/%3A/gi, ':')
-    }
+    const {
+      Modal,
+      Button,
+      PathLabel,
+      FileTypeIcon,
+      StateDot,
+      Toast,
+      IconCloseOutlineRegular,
+      IconEditOutlineRegular,
+      IconRightUpOutlineRegular,
+      languageForPath,
+      fileSizeText,
+    } = primitives
 
-    function sessionFileAddress(sessionId, path) {
-      const normalized = String(path).replace(/\\/g, '/').replace(/^(?:\.\/)+/, '')
-      return `dsh-resource://file/session/${encodeSegment(sessionId)}/${normalized
-        .split('/')
-        .map(encodeSegment)
-        .join('/')}`
-    }
+    // ── chunks ──────────────────────────────────────────────────────────────
+    let chunks = null
+    let chunksPromise = null
 
-    function isAbsolutePath(value) {
-      return value.startsWith('/') || value.startsWith('\\\\') || /^[A-Za-z]:[\\/]/.test(value)
-    }
-
-    // DSH normalizes backslashes to forward slashes when it addresses a file, so
-    // the viewer does the same for every path it resolves; POSIX paths are
-    // untouched apart from their separators.
-    function normalizeTargetPath(value) {
-      return String(value).replace(/\\/g, '/')
-    }
-
-    function joinPath(base, path) {
-      if (isAbsolutePath(path)) return normalizeTargetPath(path)
-      const root = normalizeTargetPath(base).replace(/\/+$/, '')
-      if (root === '') return normalizeTargetPath(path)
-      return `${root}/${normalizeTargetPath(path).replace(/^\/+/, '')}`
-    }
-
-    function basenameOf(path) {
-      const normalized = String(path).replace(/\\/g, '/').replace(/\/+$/, '')
-      const cut = normalized.lastIndexOf('/')
-      return cut === -1 ? normalized : normalized.slice(cut + 1)
-    }
-
-    function dirnameOf(path) {
-      const normalized = String(path).replace(/\\/g, '/').replace(/\/+$/, '')
-      const cut = normalized.lastIndexOf('/')
-      return cut <= 0 ? '/' : normalized.slice(0, cut)
-    }
-
-    function extensionOf(path) {
-      const base = basenameOf(path)
-      const dot = base.lastIndexOf('.')
-      return dot <= 0 || dot === base.length - 1 ? '' : base.slice(dot + 1).toLowerCase()
-    }
-
-    function decodeLoose(text) {
-      try {
-        return decodeURIComponent(text)
-      } catch {
-        return text
-      }
-    }
-
-    // A file link may name a line either GitHub-style (`file.md#L92`,
-    // `#L92-L99`) or as a trailing colon form (`file.dos:48`, also `:48:7` for
-    // line:column). Both are line targets on the same file: the path itself is
-    // resolved without the suffix.
-    function lineFromFragment(fragment) {
-      if (typeof fragment !== 'string') return undefined
-      const value = fragment.trim()
-      const range = /^L(\d{1,7})(?:-L?(\d{1,7}))?$/.exec(value)
-      if (range !== null) return Number(range[1])
-      const plain = /^(\d{1,7})$/.exec(value)
-      return plain === null ? undefined : Number(plain[1])
-    }
-
-    function splitLineSuffix(path) {
-      const value = String(path)
-      // Non-greedy so `file.py:12:5` splits as (file.py, 12, 5) rather than as a
-      // line target on a name that merely ends in `:12`.
-      const match = /^(.*?):(\d{1,7})(?::\d{1,7})?$/.exec(value)
-      if (match === null) return { path: value, line: undefined }
-      const base = match[1]
-      const extension = extensionOf(base)
-      const looksLikeFile = (extension !== '' && /^[a-z][a-z0-9]{0,9}$/.test(extension)) || BARE_FILE_NAMES.has(basenameOf(base).toLowerCase())
-      if (!looksLikeFile) return { path: value, line: undefined }
-      return { path: base, line: Number(match[2]) }
-    }
-
-    function fileInfo(path) {
-      const extension = extensionOf(path)
-      if (MARKDOWN_EXTENSIONS.has(extension)) return { kind: 'markdown' }
-      if (IMAGE_MIME[extension] !== undefined) return { kind: 'image', mime: IMAGE_MIME[extension] }
-      if (PDF_EXTENSIONS.has(extension)) return { kind: 'pdf' }
-      if (HTML_EXTENSIONS.has(extension)) return { kind: 'html' }
-      if (OFFICE_EXTENSIONS.has(extension)) return { kind: 'office' }
-      return { kind: 'auto', language: languageForPath(path) }
-    }
-
-    // ── link classification ────────────────────────────────────────────────
-    // Returns null for everything the plugin must leave alone: HTTP(S) links
-    // keep their ordinary browser behaviour, as do in-app hash routes and every
-    // non-file scheme.
-    // `file:` URLs: POSIX (`file:///a/b`), Windows drive (`file:///C:/a/b`) and
-    // UNC (`file://server/share/a/b`) all reduce to a host path.
-    function parseFileURL(raw) {
-      let path
-      try {
-        const url = new URL(raw)
-        const pathname = decodeLoose(url.pathname)
-        path = url.host === '' ? pathname : `//${url.host}${pathname}`
-      } catch {
-        path = decodeLoose(raw.replace(/^file:\/\//i, ''))
-        if (!path.startsWith('/')) path = `/${path}`
-      }
-      if (/^\/[A-Za-z]:[\\/]/.test(path)) path = path.slice(1)
-      return path === '' ? null : path
-    }
-
-    function classifyHref(href) {
-      const raw = String(href).trim()
-      if (raw === '' || raw.startsWith('#')) return null
-      // A Windows drive path (`C:\dir\file.md`) is a file, not a URL scheme.
-      const windowsAbsolute = /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith('\\\\')
-      if (!windowsAbsolute) {
-        if (/^(?:[a-z][a-z0-9+.-]*:)/i.test(raw) && !/^file:/i.test(raw)) return null
-        if (raw.startsWith('//')) return null
-      }
-      let path
-      let fragment
-      if (/^file:/i.test(raw)) {
-        const hashAt = raw.indexOf('#')
-        if (hashAt !== -1) fragment = decodeLoose(raw.slice(hashAt + 1))
-        path = parseFileURL(hashAt === -1 ? raw : raw.slice(0, hashAt))
-        if (path === null) return null
-      } else {
-        const hashAt = raw.indexOf('#')
-        if (hashAt !== -1) {
-          fragment = decodeLoose(raw.slice(hashAt + 1))
-          path = decodeLoose(raw.slice(0, hashAt).split('?')[0])
-        } else {
-          path = decodeLoose(raw.split('?')[0])
-        }
-      }
-      path = normalizeTargetPath(path)
-      if (path === '') return null
-      const suffix = splitLineSuffix(path)
-      const clean = suffix.path
-      const extension = extensionOf(clean)
-      const looksLikeFile = (extension !== '' && /^[a-z][a-z0-9]{0,9}$/.test(extension)) || BARE_FILE_NAMES.has(basenameOf(clean).toLowerCase()) || isAbsolutePath(clean)
-      if (!looksLikeFile) return null
-      return { path: clean, absolute: isAbsolutePath(clean), line: lineFromFragment(fragment) ?? suffix.line }
-    }
-
-    // ── async helpers ──────────────────────────────────────────────────────
-    function withTimeout(promise, ms, fallback) {
-      return new Promise((resolve) => {
-        let settled = false
-        const finish = (value) => {
-          if (settled) return
-          settled = true
-          resolve(value)
-        }
-        const timer = setTimeout(() => finish(fallback), ms)
-        Promise.resolve(promise).then(
-          (value) => {
-            clearTimeout(timer)
-            finish(value)
-          },
-          () => {
-            clearTimeout(timer)
-            finish(fallback)
-          },
-        )
-      })
-    }
-
-    function callRemote(namespace, method, args) {
-      return new Promise((resolve) => {
-        try {
-          if (namespace === null || namespace === undefined || typeof namespace[method] !== 'function') {
-            resolve({ ok: false, error: { code: 'client/no-remote' } })
-            return
-          }
-          const pending = namespace[method](...args)
-          if (pending !== null && typeof pending === 'object' && typeof pending.then === 'function') {
-            pending.then(
-              (result) => resolve(result !== null && typeof result === 'object' ? result : { ok: false, error: { code: 'client/bad-result' } }),
-              (error) => resolve({ ok: false, error: { code: 'client/call-failed', message: error instanceof Error ? error.message : String(error) } }),
-            )
-          } else {
-            resolve(pending !== null && typeof pending === 'object' ? pending : { ok: false, error: { code: 'client/bad-result' } })
-          }
-        } catch (error) {
-          resolve({ ok: false, error: { code: 'client/call-failed', message: error instanceof Error ? error.message : String(error) } })
-        }
-      })
-    }
-
-    async function statRemote(ctx, sessionId, path) {
-      const result = await callRemote(ctx.remote.workspaceFiles, 'stat', [sessionId, path])
-      return result.ok === true && result.value !== null && typeof result.value === 'object' && typeof result.value.absolutePath === 'string' ? result.value : null
-    }
-
-    async function readTextRemote(ctx, sessionId, path, signal, maxChars) {
-      let offset = 1
-      let text = ''
-      for (let page = 0; page < MAX_TEXT_PAGES; page += 1) {
-        const result = await callRemote(ctx.remote.workspaceFiles, 'read', [sessionId, path, { offset }, signal])
-        if (result.ok !== true) {
-          const code = result.error?.code ?? 'workspace-file/read-failed'
-          return { ok: false, code }
-        }
-        const value = result.value ?? {}
-        if (page > 0 && typeof value.text === 'string' && value.text !== '') text += '\n'
-        if (typeof value.text === 'string') text += value.text
-        if (value.eof === true) return { ok: true, text, truncated: false }
-        const lines = typeof value.lines === 'number' ? value.lines : 0
-        if (lines === 0 || text.length >= maxChars) return { ok: true, text, truncated: true }
-        offset += lines
-      }
-      return { ok: true, text, truncated: true }
-    }
-
-    // ── sources of a working directory ─────────────────────────────────────
-    function sessionSnapshot(ctx) {
-      let snapshot
-      try {
-        snapshot = ctx.sessions.list.getSnapshot()
-      } catch {
-        snapshot = null
-      }
-      const byId = snapshot !== null && typeof snapshot === 'object' && typeof snapshot.byId === 'object' && snapshot.byId !== null ? snapshot.byId : {}
-      const ids = Object.keys(byId)
-      const currentId = typeof snapshot?.current === 'string' ? snapshot.current : undefined
-      const ordered = currentId !== undefined && ids.includes(currentId) ? [currentId, ...ids.filter((id) => id !== currentId)] : ids
-      const sessions = []
-      for (const id of ordered) {
-        const row = byId[id]
-        const cwd = typeof row?.cwd === 'string' && row.cwd !== '' ? row.cwd : undefined
-        sessions.push({ id, cwd })
-        if (sessions.length >= MAX_STAT_SESSIONS) break
-      }
-      return { currentId, sessions }
-    }
-
-    function currentSessionId(ctx) {
-      try {
-        const id = ctx.sessions.list.getSnapshot().current
-        return typeof id === 'string' ? id : undefined
-      } catch {
-        return undefined
-      }
-    }
-
-    // The ThoughtDAG host half serves the canvas SPA and the session bridge under
-    // the mount prefix; read it from the iframe the host half created.
-    function thoughtdagMount() {
-      const frames = document.querySelectorAll('[data-dsh-thoughtdag] iframe')
-      for (const frame of frames) {
-        const source = frame.dataset?.src ?? frame.getAttribute('src') ?? ''
-        if (typeof source !== 'string' || source === '') continue
-        try {
-          const url = new URL(source, window.location.origin)
-          return url.href.replace(/\/?$/, '/')
-        } catch {
-          continue
-        }
-      }
-      return '/thoughtdag/'
-    }
-
-    async function diskSessions() {
-      try {
-        const response = await fetch(`${thoughtdagMount()}api/disksessions`, { headers: { accept: 'application/json' } })
-        if (!response.ok) return []
-        const body = await response.json()
-        return Array.isArray(body?.sessions) ? body.sessions : []
-      } catch {
-        return []
-      }
-    }
-
-    // The canvas keeps its project (and that project's working directory) in the
-    // embedded SPA's persisted store — idb-keyval's `keyval-store`/`keyval`.
-    // Returns the active project's own directory first, then every other
-    // directory-looking value. Read without ever creating the database:
-    // `indexedDB.databases()` proves it exists before the versioned open.
-    const persistedCache = { at: 0, value: null }
-    const PERSISTED_CACHE_MS = 15000
-
-    function collectPersistedDirs(values) {
-      const preferred = []
-      const dirs = new Set()
-      let budget = 20000
-      const takeDir = (candidate) => {
-        if (typeof candidate !== 'string' || /[\u0000-\u001f]/.test(candidate) || candidate.length >= 1024) return undefined
-        const normalized = normalizeTargetPath(candidate).replace(/\/+$/, '')
-        if (/^[A-Za-z]:$/.test(normalized)) return normalized
-        return isAbsolutePath(normalized) && normalized !== '' ? normalized : undefined
-      }
-      const visit = (value, key, depth) => {
-        if (budget <= 0 || depth > 8 || value === null || value === undefined) return
-        budget -= 1
-        if (typeof value === 'string') {
-          if (key !== null && key !== undefined && DIR_KEY.test(key) && dirs.size < MAX_BASES) {
-            const dir = takeDir(value)
-            if (dir !== undefined && dir !== '') dirs.add(dir)
-          }
-          return
-        }
-        if (Array.isArray(value)) {
-          for (const item of value) visit(item, key, depth + 1)
-          return
-        }
-        if (typeof value !== 'object') return
-        if (typeof value.activeId === 'string' && Array.isArray(value.projects)) {
-          const active = value.projects.find((project) => project !== null && typeof project === 'object' && project.id === value.activeId)
-          if (active !== null && typeof active === 'object') {
-            for (const field of ['agentCwd', 'cwd', 'workingDir', 'rootDir']) {
-              const dir = takeDir(active[field])
-              if (dir !== undefined && dir !== '' && !preferred.includes(dir)) preferred.push(dir)
-            }
-          }
-        }
-        for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey, depth + 1)
-      }
-      for (const value of values) visit(value, null, 0)
-      return { preferred, dirs: [...dirs] }
-    }
-
-    async function readPersistedDirs() {
-      try {
-        if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') return { preferred: [], dirs: [] }
-        const databases = await indexedDB.databases()
-        const info = Array.isArray(databases) ? databases.find((entry) => entry?.name === 'keyval-store') : undefined
-        if (info === undefined) return { preferred: [], dirs: [] }
-        const db = await new Promise((resolve, reject) => {
-          const request = typeof info.version === 'number' ? indexedDB.open('keyval-store', info.version) : indexedDB.open('keyval-store')
-          request.onerror = () => reject(request.error)
-          request.onupgradeneeded = () => {
-            try {
-              request.transaction?.abort()
-            } catch {
-              // the fallback is optional
-            }
-          }
-          request.onsuccess = () => resolve(request.result)
+    function ensureChunks() {
+      if (chunks !== null) return Promise.resolve(chunks)
+      if (chunksPromise !== null) return chunksPromise
+      chunksPromise = Promise.all([
+        require.async('./client.util.js'),
+        require.async('./client.remote.js'),
+        require.async('./client.styles.js'),
+        require.async('./client.tabs.js'),
+        require.async('./client.preview.js'),
+        require.async('./client.editor.js'),
+      ])
+        .then(([util, remote, styles, tabs, preview, editor]) => {
+          chunks = { util, remote, styles, tabs, preview, editor }
+          return chunks
         })
-        try {
-          if (!db.objectStoreNames.contains('keyval')) return { preferred: [], dirs: [] }
-          const values = await new Promise((resolve) => {
-            try {
-              const store = db.transaction('keyval', 'readonly').objectStore('keyval')
-              const all = store.getAll()
-              all.onerror = () => resolve([])
-              all.onsuccess = () => resolve(Array.isArray(all.result) ? all.result : [])
-            } catch {
-              resolve([])
-            }
-          })
-          return collectPersistedDirs(values)
-        } finally {
-          try {
-            db.close()
-          } catch {
-            // already closed
-          }
-        }
-      } catch {
-        return { preferred: [], dirs: [] }
-      }
-    }
-
-    async function canvasProjectDirs() {
-      if (persistedCache.value !== null && Date.now() - persistedCache.at < PERSISTED_CACHE_MS) return persistedCache.value
-      const value = await readPersistedDirs()
-      if (value.preferred.length > 0 || value.dirs.length > 0) {
-        persistedCache.value = value
-        persistedCache.at = Date.now()
-      }
-      return value
-    }
-
-    // ── resolution ─────────────────────────────────────────────────────────
-    // Resolve a clicked/linked href to `{ sessionId, absolutePath }`, or null.
-    async function resolveTarget(ctx, target, extraBases) {
-      const snapshot = sessionSnapshot(ctx)
-      const authorizers = []
-      if (snapshot.currentId !== undefined) authorizers.push(snapshot.currentId)
-      for (const session of snapshot.sessions) if (!authorizers.includes(session.id)) authorizers.push(session.id)
-
-      const disk = await withTimeout(diskSessions(), RESOLVE_TIMEOUT_MS, [])
-      for (const row of disk) if (typeof row?.id === 'string' && row.id !== '' && !authorizers.includes(row.id)) authorizers.push(row.id)
-      const authorizer = authorizers[0]
-      if (authorizer === undefined) return null
-
-      const wanted = normalizeTargetPath(target.path)
-      if (isAbsolutePath(wanted)) {
-        const hit = await statRemote(ctx, authorizer, wanted)
-        return hit === null ? null : { sessionId: authorizer, absolutePath: typeof hit.absolutePath === 'string' ? hit.absolutePath : wanted }
-      }
-
-      const persisted = await withTimeout(canvasProjectDirs(), 1200, { preferred: [], dirs: [] })
-      const bases = []
-      const seen = new Set()
-      const push = (candidate) => {
-        if (typeof candidate !== 'string' || candidate === '') return
-        const normalized = normalizeTargetPath(candidate).replace(/\/+$/, '')
-        // Keep a bare drive root (`C:`): joining it with `joinPath` restores it.
-        const usable = /^[A-Za-z]:$/.test(normalized) ? normalized : isAbsolutePath(normalized) ? normalized : ''
-        if (usable === '' || seen.has(usable)) return
-        seen.add(usable)
-        bases.push(usable)
-      }
-      // A link inside a previewed document resolves against that document's own
-      // directory first, then the canvas's project folder, then the sessions.
-      for (const dir of extraBases) push(dir)
-      for (const dir of persisted.preferred) push(dir)
-      for (const session of snapshot.sessions) push(session.cwd)
-      for (const row of disk) push(row?.cwd)
-      for (const dir of persisted.dirs) push(dir)
-
-      const attempts = bases.slice(0, MAX_BASES).map(async (base) => {
-        const absolutePath = joinPath(base, wanted)
-        const hit = await statRemote(ctx, authorizer, absolutePath)
-        return hit === null ? null : { sessionId: authorizer, absolutePath: typeof hit.absolutePath === 'string' ? hit.absolutePath : absolutePath }
-      })
-      const settled = await withTimeout(Promise.all(attempts), RESOLVE_TIMEOUT_MS, [])
-      return Array.isArray(settled) ? settled.find((hit) => hit !== null && hit !== undefined) ?? null : null
-    }
-
-    // ── the in-page viewer state ───────────────────────────────────────────
-    const viewer = { state: null, token: 0, controller: null, listeners: new Set() }
-
-    function getViewer() {
-      return viewer.state
-    }
-
-    function subscribeViewer(listener) {
-      viewer.listeners.add(listener)
-      return () => {
-        viewer.listeners.delete(listener)
-      }
-    }
-
-    function emitViewer() {
-      for (const listener of [...viewer.listeners]) {
-        try {
-          listener()
-        } catch {
-          // a broken listener must not break the others
-        }
-      }
-    }
-
-    function patchViewer(patch) {
-      if (viewer.state === null) return
-      viewer.state = { ...viewer.state, ...patch }
-      emitViewer()
-    }
-
-    function closeViewer() {
-      const previous = viewer.state
-      viewer.token += 1
-      try {
-        viewer.controller?.abort()
-      } catch {
-        // already aborted
-      }
-      viewer.controller = null
-      viewer.state = null
-      if (previous !== null && previous.url !== undefined) {
-        try {
-          URL.revokeObjectURL(previous.url)
-        } catch {
-          // already revoked
-        }
-      }
-      emitViewer()
-    }
-
-    async function openViewerFile(ctx, hit, line) {
-      closeViewer()
-      const token = ++viewer.token
-      const controller = new AbortController()
-      viewer.controller = controller
-      const fileName = basenameOf(hit.absolutePath)
-      const info = fileInfo(hit.absolutePath)
-      const targetLine = typeof line === 'number' && Number.isFinite(line) && line > 0 ? Math.floor(line) : undefined
-      viewer.state = {
-        fileName,
-        absolutePath: hit.absolutePath,
-        sessionId: hit.sessionId,
-        phase: 'loading',
-        kind: info.kind === 'auto' ? 'code' : info.kind,
-        origin: info.kind,
-        line: targetLine,
-      }
-      emitViewer()
-      try {
-        if (info.kind === 'image' || info.kind === 'pdf' || info.kind === 'html') {
-          const result = await callRemote(ctx.remote.workspaceFiles, 'readBytes', [hit.sessionId, hit.absolutePath, {}, controller.signal])
-          if (token !== viewer.token) return
-          if (result.ok !== true) {
-            patchViewer({ phase: 'ready', kind: 'unsupported', reason: 'readFailed' })
-            return
-          }
-          const data = result.value?.data
-          const mime = info.kind === 'image' ? info.mime : info.kind === 'pdf' ? 'application/pdf' : 'text/html'
-          const url = URL.createObjectURL(new Blob([data], { type: mime }))
-          patchViewer({ phase: 'ready', kind: info.kind, url, bytes: result.value?.bytes })
-          return
-        }
-        if (info.kind === 'office') {
-          if (ctx.remote?.officeToPdf === undefined) {
-            patchViewer({ phase: 'ready', kind: 'unsupported', reason: 'office' })
-            return
-          }
-          const result = await callRemote(ctx.remote.officeToPdf, 'render', [hit.sessionId, hit.absolutePath, 'foreground', controller.signal])
-          if (token !== viewer.token) return
-          if (result.ok !== true) {
-            patchViewer({ phase: 'ready', kind: 'unsupported', reason: 'office' })
-            return
-          }
-          const url = URL.createObjectURL(new Blob([result.value?.data], { type: 'application/pdf' }))
-          patchViewer({ phase: 'ready', kind: 'pdf', origin: 'office', url, bytes: result.value?.bytes })
-          return
-        }
-        const read = await readTextRemote(ctx, hit.sessionId, hit.absolutePath, controller.signal, info.kind === 'markdown' ? MAX_MARKDOWN_CHARS : MAX_CODE_CHARS)
-        if (token !== viewer.token) return
-        if (read.ok !== true) {
-          patchViewer({ phase: 'ready', kind: 'unsupported', reason: read.code === 'workspace-file/too-large' ? 'tooLarge' : read.code === 'workspace-file/not-text' ? 'binary' : 'readFailed' })
-          return
-        }
-        patchViewer({ kind: info.kind === 'markdown' ? 'markdown' : 'code', phase: 'ready', text: read.text, truncated: read.truncated === true, language: info.language })
-      } catch (error) {
-        if (token !== viewer.token) return
-        patchViewer({ phase: 'error', error: error instanceof Error ? error.message : String(error) })
-      }
-    }
-
-    // ── open in the harness's own document window (fallback) ──────────────
-    function readMounted(ctx) {
-      try {
-        return ctx.sidebarRight?.mounted?.getSnapshot?.()
-      } catch {
-        return undefined
-      }
-    }
-
-    function selectSession(ctx, sessionId) {
-      const sessions = ctx.sessions
-      const select = sessions?.open ?? sessions?.select
-      if (typeof select !== 'function') return false
-      try {
-        select.call(sessions, sessionId)
-        return true
-      } catch {
-        return false
-      }
-    }
-
-    function dismissCanvasOverlay() {
-      try {
-        window.postMessage({ source: 'dsh-thoughtdag', type: 'td:close' }, window.location.origin)
-      } catch {
-        // no listener: nothing to dismiss
-      }
-    }
-
-    function openDocumentTab(ctx, sessionId, address) {
-      return new Promise((resolve) => {
-        const deadline = Date.now() + OPEN_TIMEOUT_MS
-        const attempt = () => {
-          if (readMounted(ctx) === sessionId) {
-            try {
-              ctx.sidebarRight.openResource(address)
-              resolve(true)
-              return
-            } catch {
-              // surface not adopted yet; retry on the next frame
-            }
-          }
-          if (Date.now() >= deadline) {
-            resolve(false)
-            return
-          }
-          requestAnimationFrame(attempt)
-        }
-        attempt()
-      })
-    }
-
-    async function openInDsWindow(ctx, hit) {
-      let sessionId = currentSessionId(ctx)
-      if (sessionId === undefined) {
-        sessionId = hit.sessionId
-        selectSession(ctx, sessionId)
-      }
-      try {
-        ctx.layout.selectPanel('conversation')
-      } catch {
-        try {
-          ctx.layout.selectPanel(null)
-        } catch {
-          // the host keeps its layout
-        }
-      }
-      const address = sessionFileAddress(sessionId, hit.absolutePath)
-      if (await openDocumentTab(ctx, sessionId, address)) return true
-      dismissCanvasOverlay()
-      return openDocumentTab(ctx, sessionId, address)
+        .catch((error) => {
+          chunksPromise = null
+          throw error
+        })
+      return chunksPromise
     }
 
     // ── toast ──────────────────────────────────────────────────────────────
@@ -685,134 +98,42 @@ window.__ModuleLoader__.load({
         try {
           listener()
         } catch {
-          // ignore
+          // ignore one broken listener
         }
       }
     }
 
-    function showToast(text) {
-      if (typeof text !== 'string' || text === '') return
-      toastState.seq += 1
-      toastState.current = { text, seq: toastState.seq }
-      emitToast()
-    }
-
-    // ── stylesheet (owned by this plugin, removed with it) ─────────────────
-    const CSS = `
-.dsh-tdfi-dialog.dsh-tdfi-dialog{width:min(1080px,94vw)!important;max-height:min(92vh,100%)!important;gap:16px}
-.dsh-tdfi-content.dsh-tdfi-content{overflow:auto;min-height:0;max-height:calc(92vh - 200px)}
-.dsh-tdfi-head{display:flex;align-items:center;gap:10px;min-width:0}
-.dsh-tdfi-path{min-width:0;flex:1;font-size:12px}
-.dsh-tdfi-meta{flex:none;font-size:12px;color:var(--dsw-alias-label-secondary)}
-.dsh-tdfi-loading{display:flex;align-items:center;gap:10px;padding:22px 0;font-size:13px;color:var(--dsw-alias-label-secondary)}
-.dsh-tdfi-md{padding:4px 0 18px;min-width:0}
-.dsh-tdfi-code{padding:4px 0 18px;min-width:0}
-.dsh-tdfi-image{display:flex;align-items:center;justify-content:center;padding:4px 0 18px}
-.dsh-tdfi-image img{max-width:100%;max-height:calc(92vh - 270px);border-radius:8px;object-fit:contain}
-.dsh-tdfi-frame{display:block;width:100%;height:calc(92vh - 270px);border:0;border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
-.dsh-tdfi-unsupported{display:flex;flex-direction:column;align-items:center;gap:14px;padding:32px 0;text-align:center;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-secondary)}
-.dsh-tdfi-note{padding:0 0 14px;font-size:12px;color:var(--dsw-alias-label-secondary)}
-.dsh-tdfi-error{padding:18px 0;font-size:13px;line-height:1.6;color:var(--dsw-alias-state-error-primary)}
-`
-
-    // ── click bridge over the canvas iframe ────────────────────────────────
-    function handleCanvasClick(event, openTarget) {
-      if (event.defaultPrevented) return
-      if (typeof event.button === 'number' && event.button !== 0) return
-      const target = event.target
-      const element = target !== null && target !== undefined && target.nodeType === 1 ? target : target?.parentElement
-      const anchor = element !== null && element !== undefined && typeof element.closest === 'function' ? element.closest('a[href]') : null
-      if (anchor === null || anchor === undefined) return
-      const classified = classifyHref(anchor.getAttribute('href') ?? '')
-      if (classified === null) return
-      event.preventDefault()
-      event.stopPropagation()
-      openTarget(classified)
-    }
-
-    function installFrameBridge(ctx, openTarget) {
-      let bound
-      let timer = 0
-
-      const unbind = () => {
-        if (bound === undefined) return
-        try {
-          bound.frame.removeEventListener('load', bound.onLoad)
-        } catch {
-          // frame gone
-        }
-        try {
-          bound.doc?.removeEventListener('click', bound.onClick, true)
-        } catch {
-          // document gone
-        }
-        bound = undefined
-      }
-
-      const bind = (frame) => {
-        if (bound !== undefined && bound.frame === frame) return
-        unbind()
-        const entry = { frame, doc: null, onClick: null, onLoad: null }
-        const attach = () => {
-          let doc = null
-          try {
-            doc = entry.frame.contentDocument
-          } catch {
-            doc = null
-          }
-          if (doc === null) return
-          if (entry.doc === doc) return
-          if (entry.doc !== null) {
-            try {
-              entry.doc.removeEventListener('click', entry.onClick, true)
-            } catch {
-              // replaced document
-            }
-          }
-          entry.doc = doc
-          try {
-            doc.addEventListener('click', entry.onClick, true)
-          } catch {
-            entry.doc = null
-          }
-        }
-        entry.onClick = (event) => handleCanvasClick(event, openTarget)
-        entry.onLoad = () => attach()
-        try {
-          frame.addEventListener('load', entry.onLoad)
-        } catch {
-          // detached frame
-        }
-        attach()
-        bound = entry
-      }
-
-      const find = () => {
-        const frame = document.querySelector('[data-dsh-thoughtdag] iframe')
-        if (frame === null) return
-        bind(frame)
-        if (bound !== undefined && bound.doc !== null && timer !== 0) {
-          clearInterval(timer)
-          timer = 0
-        }
-      }
-
-      find()
-      if (timer === 0) timer = setInterval(find, 1000)
-      return () => {
-        if (timer !== 0) clearInterval(timer)
-        timer = 0
-        unbind()
-      }
-    }
+    // The viewer renders Markdown, code highlighting and the dialog chrome with
+    // the same platform primitives the chat uses (the v2 dependency this plugin
+    // shipped with). A renamed primitive would throw while rendering the overlay
+    // slot, so fail once, loudly, instead of blanking the slot.
+    const REQUIRED_PRIMITIVES = [
+      'Modal',
+      'Button',
+      'PathLabel',
+      'FileTypeIcon',
+      'StateDot',
+      'Toast',
+      'IconCloseOutlineRegular',
+      'IconEditOutlineRegular',
+      'IconRightUpOutlineRegular',
+      'languageForPath',
+      'fileSizeText',
+    ]
 
     // ── plugin body ────────────────────────────────────────────────────────
     module.exports.inject = ['sessions', 'layout', 'remote', 'remote.workspaceFiles', 'sidebarRight', 'locale', 'slots']
     module.exports.apply = (ctx) => {
+      const missing = REQUIRED_PRIMITIVES.filter((name) => primitives?.[name] === undefined)
+      if (missing.length > 0) {
+        console.warn('[dsh-thoughtdag-file-open] UI primitives are unavailable:', missing.join(', '))
+        return
+      }
       ctx.effect(
         () =>
           ctx.locale.register(NS, {
             zh: {
+              title: '文件预览',
               loading: '正在加载文件…',
               close: '关闭',
               copy: '复制',
@@ -822,6 +143,7 @@ window.__ModuleLoader__.load({
               unwrap: '不换行',
               footnotes: '脚注',
               truncated: '文件较大，这里只显示前面的内容。',
+              truncatedEdit: '这个文件只读取了前面一部分，不能直接编辑；请在文件窗口中打开后编辑。',
               unresolved: '找不到这个文件：{path}\n请确认画布的工作目录后重试。',
               unsupportedBinary: '这个文件是二进制或暂不支持的格式，无法在这里预览。',
               unsupportedOffice: '这个 Office 文件无法转换预览，可以在 DSH 的文件窗口中打开。',
@@ -830,8 +152,36 @@ window.__ModuleLoader__.load({
               error: '打开这个文件时出错。',
               line: '第 {line} 行',
               openInWindow: '在文件窗口打开',
+              edit: '编辑',
+              preview: '预览',
+              save: '保存',
+              saving: '正在保存…',
+              saved: '已保存',
+              unsaved: '未保存的修改',
+              previewMode: '预览模式',
+              cancel: '取消',
+              closeTab: '关闭标签页',
+              tabsLabel: '已打开的文件',
+              unsavedTitle: '有未保存的修改',
+              unsavedBody: '“{name}” 有未保存的修改，关闭后会丢失。',
+              unsavedBodyMany: '有 {count} 个文件包含未保存的修改，关闭后会丢失。',
+              discard: '放弃修改',
+              discardEditTitle: '放弃当前修改？',
+              discardEditBody: '编辑内容还没有保存，返回预览会丢失这些修改。',
+              discardEdit: '放弃修改',
+              saveAndClose: '保存并关闭',
+              saveFailed: '保存失败：{message}',
+              conflict: '文件已在磁盘上被修改，请重新加载或仍然保存。',
+              conflictReload: '重新加载',
+              conflictForce: '仍然保存',
+              editUnavailable: '当前 Host 不支持保存文件，只能预览。',
+              editorLabel: '文件内容编辑器',
+              editorFallback: 'CodeMirror 没有启动成功，已退回纯文本编辑器（{message}）。',
+              hintSave: 'Ctrl/⌘ S 保存',
+              hintEdit: 'Ctrl/⌘ E 编辑',
             },
             en: {
+              title: 'File preview',
               loading: 'Loading file…',
               close: 'Close',
               copy: 'Copy',
@@ -841,6 +191,7 @@ window.__ModuleLoader__.load({
               unwrap: 'No wrap',
               footnotes: 'Footnotes',
               truncated: 'This file is large; only the beginning is shown.',
+              truncatedEdit: 'Only the beginning of this large file was read, so it cannot be edited here; open it in the document window instead.',
               unresolved: 'Could not find this file: {path}\nCheck the canvas working directory and try again.',
               unsupportedBinary: 'This file is binary or in a format the in-page viewer does not support.',
               unsupportedOffice: 'This Office document could not be converted for preview; open it in DSH’s document window instead.',
@@ -849,211 +200,1018 @@ window.__ModuleLoader__.load({
               error: 'Opening this file failed.',
               line: 'Line {line}',
               openInWindow: 'Open in document window',
+              edit: 'Edit',
+              preview: 'Preview',
+              save: 'Save',
+              saving: 'Saving…',
+              saved: 'Saved',
+              unsaved: 'Unsaved changes',
+              previewMode: 'Preview mode',
+              cancel: 'Cancel',
+              closeTab: 'Close tab',
+              tabsLabel: 'Open files',
+              unsavedTitle: 'Unsaved changes',
+              unsavedBody: '“{name}” has unsaved changes that will be lost if it closes.',
+              unsavedBodyMany: '{count} files have unsaved changes that will be lost if they close.',
+              discard: 'Discard',
+              discardEditTitle: 'Discard these changes?',
+              discardEditBody: 'The editor content is not saved yet; going back to the preview loses it.',
+              discardEdit: 'Discard',
+              saveAndClose: 'Save & close',
+              saveFailed: 'Saving failed: {message}',
+              conflict: 'The file changed on disk. Reload it or save anyway.',
+              conflictReload: 'Reload',
+              conflictForce: 'Save anyway',
+              editUnavailable: 'This Host does not support saving files; preview only.',
+              editorLabel: 'File content editor',
+              editorFallback: 'CodeMirror did not start; using the plain text editor instead ({message}).',
+              hintSave: 'Ctrl/⌘ S to save',
+              hintEdit: 'Ctrl/⌘ E to edit',
             },
           }),
         'dsh-thoughtdag-file-open: dictionaries',
       )
       const t = ctx.locale.bind(NS)
 
-      ctx.effect(() => {
-        const style = document.createElement('style')
-        style.setAttribute('data-plugin', NS)
-        style.textContent = CSS
-        document.head.append(style)
-        return () => {
-          style.remove()
+      // ── Host-facing API (available once the chunks arrive) ────────────────
+      let host = null
+      let capabilities = null
+      let editingSupported = false
+      let uiComponents = null
+
+      async function hostApi() {
+        const loaded = await ensureChunks()
+        if (host === null) host = { remote: loaded.remote.createRemote({ ctx, util: loaded.util }), util: loaded.util }
+        return host
+      }
+
+      function ensureCapabilities() {
+        if (capabilities !== null) return capabilities
+        capabilities = hostApi()
+          .then(({ remote }) => remote.capabilities())
+          .then((result) => {
+            editingSupported = result.editing === true
+            emitView()
+            return result
+          })
+          .catch(() => {
+            editingSupported = false
+            emitView()
+            return { ok: false, editing: false }
+          })
+        return capabilities
+      }
+
+      /** A tab is editable only when it is complete text: a truncated read must never be saved back. */
+      function canEditTab(tab) {
+        return (
+          tab !== null &&
+          tab.phase === 'ready' &&
+          tab.truncated !== true &&
+          chunks !== null &&
+          chunks.util.isEditableKind(tab.kind)
+        )
+      }
+
+      function components() {
+        if (uiComponents !== null) return uiComponents
+        const tabs = chunks.tabs.createTabs({ primitives })
+        const preview = chunks.preview.createPreview({ util: chunks.util, t })
+        const editor = chunks.editor.createEditor({ t })
+        uiComponents = {
+          TabStrip: tabs.TabStrip,
+          ConfirmOverlay: tabs.ConfirmOverlay,
+          PreviewBody: preview.PreviewBody,
+          Editor: editor.Editor,
+          scrollTexture: preview.scrollCodeToLine,
         }
-      }, 'dsh-thoughtdag-file-open: stylesheet')
+        return uiComponents
+      }
 
-      const codeToolbarLabels = () => ({ codeLabel: t('code'), wrapLabel: t('wrap'), unwrapLabel: t('unwrap') })
-      const markdownLabels = () => ({ code: { copyLabel: t('copy'), copiedLabel: t('copied'), toolbarLabels: codeToolbarLabels() }, footnotes: t('footnotes') })
+      // ── view state ────────────────────────────────────────────────────────
+      // One immutable snapshot per change, so React's external-store comparison
+      // re-renders exactly once per action.
+      let view = { tabs: [], activeId: null, confirm: null }
+      const viewListeners = new Set()
+      const controllers = new Map()
+      // The mounted editor's imperative face (undefined when no editor is up).
+      let editorApi = null
+      // Last reported editor mode, so diagnostics can say CodeMirror vs fallback.
+      let editorInfo = { mode: 'idle', detail: null }
 
-      const openExternalLink = (url) => {
+      function editorReady(api) {
+        editorApi = api === undefined ? null : api
+      }
+
+      /**
+       * Push the editor's live document into the tab's draft state.
+       *
+       * Call this before any action that reads `draft` or decides on dirtiness
+       * from a debounced update: the editor syncs drafts lazily, so a save, a
+       * tab switch or a close must not race a pending debounce.
+       */
+      function flushEditor() {
         try {
-          window.open(url, '_blank', 'noopener,noreferrer')
+          editorApi?.flush?.()
         } catch {
-          // a blocked popup leaves the page where it is
+          // an already-destroyed editor has nothing to flush
         }
       }
 
-      const openLinkedFile = (state, path, options) => {
+      function getView() {
+        return view
+      }
+
+      function subscribeView(listener) {
+        viewListeners.add(listener)
+        return () => {
+          viewListeners.delete(listener)
+        }
+      }
+
+      function emitView() {
+        for (const listener of [...viewListeners]) {
+          try {
+            listener()
+          } catch {
+            // a broken listener must not break the others
+          }
+        }
+      }
+
+      function setView(patch) {
+        view = { ...view, ...patch }
+        emitView()
+      }
+
+      function tabDirty(tab) {
+        if (tab.mode !== 'edit') return false
+        // The editor reports the first keystroke before its debounced draft
+        // lands, so a pending edit counts as dirty immediately.
+        if (tab.editorDirty === true) return true
+        return typeof tab.draft === 'string' && typeof tab.savedText === 'string' && tab.draft !== tab.savedText
+      }
+
+      function patchTab(id, patch) {
+        const index = view.tabs.findIndex((tab) => tab.id === id)
+        if (index === -1) return null
+        const next = { ...view.tabs[index], ...patch }
+        next.dirty = tabDirty(next)
+        const tabs = view.tabs.slice()
+        tabs[index] = next
+        setView({ tabs })
+        return next
+      }
+
+      function findTab(id) {
+        return view.tabs.find((tab) => tab.id === id) ?? null
+      }
+
+      function activeTab() {
+        return findTab(view.activeId)
+      }
+
+      function isCurrent(id) {
+        return findTab(id) !== null
+      }
+
+      function showToast(text) {
+        if (typeof text !== 'string' || text === '') return
+        toastState.seq += 1
+        toastState.current = { text, seq: toastState.seq }
+        emitToast()
+      }
+
+      // ── reading one file into its tab ─────────────────────────────────────
+      async function loadTab(id) {
+        const tab = findTab(id)
+        if (tab === null) return
+        const { remote, util } = await hostApi()
+        if (!isCurrent(id)) return
+        const controller = new AbortController()
+        controllers.get(id)?.abort()
+        controllers.set(id, controller)
+        const info = util.fileInfo(tab.absolutePath)
+        const kind = info.kind === 'auto' ? 'code' : info.kind
+        patchTab(id, {
+          kind,
+          origin: info.kind,
+          language: kind === 'code' ? languageForPath(tab.absolutePath) : undefined,
+          phase: 'loading',
+          error: undefined,
+          reason: undefined,
+          conflict: false,
+        })
+        try {
+          if (info.kind === 'image' || info.kind === 'pdf' || info.kind === 'html') {
+            const result = await remote.readBytes(tab.sessionId, tab.absolutePath, controller.signal)
+            if (controllers.get(id) !== controller) return
+            if (result.ok !== true) {
+              patchTab(id, { phase: 'ready', kind: 'unsupported', reason: 'readFailed' })
+              return
+            }
+            const mime =
+              info.kind === 'image' ? info.mime : info.kind === 'pdf' ? 'application/pdf' : 'text/html'
+            const url = URL.createObjectURL(new Blob([result.data], { type: mime }))
+            patchTab(id, { phase: 'ready', kind: info.kind, url, bytes: result.bytes, version: result.version })
+            return
+          }
+          if (info.kind === 'office') {
+            const result = await remote.officeToPdf(tab.sessionId, tab.absolutePath, controller.signal)
+            if (controllers.get(id) !== controller) return
+            if (result.ok !== true) {
+              patchTab(id, { phase: 'ready', kind: 'unsupported', reason: 'office' })
+              return
+            }
+            const url = URL.createObjectURL(new Blob([result.data], { type: 'application/pdf' }))
+            patchTab(id, { phase: 'ready', kind: 'pdf', origin: 'office', url, bytes: result.bytes })
+            return
+          }
+          const maxChars = info.kind === 'markdown' ? util.MAX_MARKDOWN_CHARS : util.MAX_CODE_CHARS
+          const read = await remote.readText(tab.sessionId, tab.absolutePath, controller.signal, maxChars)
+          if (controllers.get(id) !== controller) return
+          if (read.ok !== true) {
+            patchTab(id, {
+              phase: 'ready',
+              kind: 'unsupported',
+              reason:
+                read.code === 'workspace-file/too-large'
+                  ? 'tooLarge'
+                  : read.code === 'workspace-file/not-text'
+                    ? 'binary'
+                    : 'readFailed',
+            })
+            return
+          }
+          const next = patchTab(id, {
+            phase: 'ready',
+            kind: info.kind === 'markdown' ? 'markdown' : 'code',
+            text: read.text,
+            savedText: read.text,
+            draft: read.text,
+            version: read.version,
+            truncated: read.truncated === true,
+          })
+          // A tab reloaded while editing keeps its draft in sync with the file.
+          if (next !== null && next.mode === 'edit') patchTab(id, { draft: read.text })
+        } catch (error) {
+          if (controllers.get(id) !== controller) return
+          patchTab(id, { phase: 'error', error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+
+      async function reloadTab(id) {
+        const tab = findTab(id)
+        if (tab === null) return
+        if (tab.url !== undefined) {
+          try {
+            URL.revokeObjectURL(tab.url)
+          } catch {
+            // already revoked
+          }
+        }
+        controllers.get(id)?.abort()
+        controllers.delete(id)
+        patchTab(id, { url: undefined, conflict: false })
+        await loadTab(id)
+      }
+
+      // ── opening a tab ─────────────────────────────────────────────────────
+      async function openHit(hit, line) {
+        const { util } = await hostApi()
+        const targetLine =
+          typeof line === 'number' && Number.isFinite(line) && line > 0 ? Math.floor(line) : undefined
+        const existing = findTab(hit.absolutePath)
+        if (existing !== null) {
+          patchTab(existing.id, { line: targetLine ?? existing.line })
+          setView({ activeId: existing.id, confirm: null })
+          if (existing.phase === 'error') reloadTab(existing.id)
+          return existing.id
+        }
+        const info = util.fileInfo(hit.absolutePath)
+        const kind = info.kind === 'auto' ? 'code' : info.kind
+        const tab = {
+          id: hit.absolutePath,
+          sessionId: hit.sessionId,
+          absolutePath: hit.absolutePath,
+          fileName: util.basenameOf(hit.absolutePath),
+          kind,
+          origin: info.kind,
+          language: kind === 'code' ? languageForPath(hit.absolutePath) : undefined,
+          phase: 'loading',
+          line: targetLine,
+          mode: 'preview',
+          text: undefined,
+          draft: undefined,
+          savedText: undefined,
+          version: undefined,
+          truncated: false,
+          bytes: undefined,
+          url: undefined,
+          reason: undefined,
+          error: undefined,
+          conflict: false,
+          saving: false,
+          dirty: false,
+        }
+        setView({ tabs: [...view.tabs, tab], activeId: tab.id, confirm: null })
+        ensureCapabilities()
+        // Reading a text preview is the moment before a likely Edit click, so
+        // warm the 696 KiB vendored editor in the background now.
+        if (kind === 'markdown' || kind === 'code') {
+          try {
+            chunks.editor.prefetchCodeMirror?.()
+          } catch {
+            // the fallback editor still works
+          }
+        }
+        loadTab(tab.id)
+        return tab.id
+      }
+
+      function activateTab(id) {
+        if (!isCurrent(id)) return
+        if (id !== view.activeId) flushEditor()
+        setView({ activeId: id, confirm: null })
+      }
+
+      // ── closing tabs and the dialog ───────────────────────────────────────
+      function closeTabNow(id) {
+        controllers.get(id)?.abort()
+        controllers.delete(id)
+        const tab = findTab(id)
+        if (tab !== null && tab.url !== undefined) {
+          try {
+            URL.revokeObjectURL(tab.url)
+          } catch {
+            // already revoked
+          }
+        }
+        const index = view.tabs.findIndex((entry) => entry.id === id)
+        const tabs = view.tabs.filter((entry) => entry.id !== id)
+        let activeId = view.activeId
+        if (activeId === id) {
+          const next = tabs[Math.min(index < 0 ? 0 : index, tabs.length - 1)]
+          activeId = next === undefined ? null : next.id
+        }
+        setView({ tabs, activeId, confirm: null })
+      }
+
+      function requestCloseTab(id) {
+        flushEditor()
+        const tab = findTab(id)
+        if (tab === null) return
+        if (tabDirty(tab)) {
+          setView({ confirm: { kind: 'closeTab', tabId: id, name: tab.fileName, count: 1 } })
+          return
+        }
+        closeTabNow(id)
+      }
+
+      function closeAllNow() {
+        for (const tab of view.tabs) {
+          controllers.get(tab.id)?.abort()
+          if (tab.url !== undefined) {
+            try {
+              URL.revokeObjectURL(tab.url)
+            } catch {
+              // already revoked
+            }
+          }
+        }
+        controllers.clear()
+        setView({ tabs: [], activeId: null, confirm: null })
+      }
+
+      function requestCloseDialog() {
+        flushEditor()
+        const dirty = view.tabs.filter((tab) => tabDirty(tab))
+        if (dirty.length === 0) {
+          closeAllNow()
+          return
+        }
+        const active = activeTab()
+        setView({
+          confirm: {
+            kind: 'closeDialog',
+            tabId: active === null ? dirty[0].id : active.id,
+            name: active === null ? dirty[0].fileName : active.fileName,
+            count: dirty.length,
+          },
+        })
+      }
+
+      // ── preview / edit mode ───────────────────────────────────────────────
+      async function setMode(id, mode) {
+        const { util } = await hostApi()
+        if (mode !== 'edit') flushEditor()
+        const tab = findTab(id)
+        if (tab === null || tab.phase !== 'ready') return
+        if (mode === 'edit') {
+          if (!util.isEditableKind(tab.kind)) return
+          if (tab.truncated === true) {
+            showToast(t('truncatedEdit'))
+            return
+          }
+          const capability = await ensureCapabilities()
+          if (capability.editing !== true) {
+            showToast(t('editUnavailable'))
+            return
+          }
+          patchTab(id, {
+            mode: 'edit',
+            draft: typeof tab.savedText === 'string' ? tab.savedText : '',
+            editorDirty: false,
+            conflict: false,
+          })
+          return
+        }
+        if (tabDirty(tab)) {
+          setView({ confirm: { kind: 'cancelEdit', tabId: id, name: tab.fileName, count: 1 } })
+          return
+        }
+        patchTab(id, { mode: 'preview', draft: tab.savedText, editorDirty: false, conflict: false })
+      }
+
+      function setDraft(id, draft) {
+        const tab = findTab(id)
+        if (tab === null || tab.mode !== 'edit') return
+        patchTab(id, { draft })
+      }
+
+      async function saveTab(id, options) {
+        const { remote } = await hostApi()
+        // Take the editor's live buffer first: the debounced draft may lag.
+        flushEditor()
+        const tab = findTab(id)
+        if (tab === null || tab.mode !== 'edit' || tab.saving === true || tab.truncated === true) return false
+        const draft = typeof tab.draft === 'string' ? tab.draft : ''
+        patchTab(id, { saving: true })
+        // Once a conflict was surfaced, the next Save is the operator's explicit
+        // 'overwrite anyway', exactly like the conflict banner's button.
+        const force = options?.force === true || tab.conflict === true
+        const result = await remote.saveFile(tab.absolutePath, draft, {
+          expectedVersion: force ? undefined : tab.version,
+          force,
+          sessionId: tab.sessionId,
+        })
+        if (result.ok !== true) {
+          if (result.code === 'FS_STALE_VERSION') {
+            patchTab(id, { saving: false, conflict: true })
+            return false
+          }
+          patchTab(id, { saving: false })
+          showToast(t('saveFailed', { message: result.message ?? '' }))
+          return false
+        }
+        patchTab(id, {
+          saving: false,
+          draft,
+          savedText: draft,
+          text: draft,
+          editorDirty: false,
+          version: result.version,
+          bytes: result.bytes,
+          conflict: false,
+        })
+        return true
+      }
+
+      // ── confirmation card actions ─────────────────────────────────────────
+      function cancelConfirm() {
+        setView({ confirm: null })
+      }
+
+      function discardConfirm() {
+        const confirm = view.confirm
+        if (confirm === null) return
+        if (confirm.kind === 'closeTab') closeTabNow(confirm.tabId)
+        else if (confirm.kind === 'closeDialog') closeAllNow()
+        else if (confirm.kind === 'cancelEdit') {
+          const tab = findTab(confirm.tabId)
+          if (tab !== null) patchTab(tab.id, { mode: 'preview', draft: tab.savedText, conflict: false })
+          setView({ confirm: null })
+        }
+      }
+
+      async function saveConfirm() {
+        const confirm = view.confirm
+        if (confirm === null) return
+        if (confirm.kind === 'closeTab') {
+          if (await saveTab(confirm.tabId)) closeTabNow(confirm.tabId)
+          else setView({ confirm: null })
+          return
+        }
+        if (confirm.kind === 'closeDialog') {
+          const dirty = view.tabs.filter((tab) => tabDirty(tab))
+          for (const tab of dirty) {
+            const saved = await saveTab(tab.id)
+            if (!saved) {
+              setView({ confirm: null })
+              return
+            }
+          }
+          closeAllNow()
+        }
+      }
+
+      // ── linked files inside a preview ─────────────────────────────────────
+      async function openLinkedFile(tab, path, options) {
+        const { remote, util } = await hostApi()
         const raw = String(path)
         const hashAt = raw.indexOf('#')
         const fragment = hashAt === -1 ? undefined : raw.slice(hashAt + 1)
         const destination = raw.slice(0, hashAt === -1 ? raw.length : hashAt).split('?')[0]
         if (destination === '') return
-        const normalized = normalizeTargetPath(destination)
-        const suffix = splitLineSuffix(normalized)
-        const line = options?.line ?? lineFromFragment(fragment) ?? suffix.line
-        resolveTarget(ctx, { path: suffix.path, absolute: isAbsolutePath(suffix.path) }, [dirnameOf(state.absolutePath)])
-          .then((hit) => {
-            if (hit === null) {
-              showToast(t('unresolved', { path: suffix.path }))
-              return null
-            }
-            return openViewerFile(ctx, hit, line)
-          })
-          .catch(() => showToast(t('error')))
-      }
-
-      const pathImagesFor = (state) => ({
-        resolve(value) {
-          const clean = normalizeTargetPath(decodeLoose(String(value).split(/[?#]/)[0]))
-          if (clean === '') return undefined
-          const absolute = isAbsolutePath(clean) ? clean : joinPath(dirnameOf(state.absolutePath), clean)
-          if (!isAbsolutePath(absolute)) return undefined
-          try {
-            return new URL(`api/file?path=${encodeURIComponent(absolute)}`, document.baseURI).href
-          } catch {
-            return undefined
-          }
-        },
-      })
-
-      const openWindowFallback = (state) => {
-        const hit = { sessionId: state.sessionId, absolutePath: state.absolutePath }
-        closeViewer()
-        openInDsWindow(ctx, hit).catch(() => showToast(t('error')))
-      }
-
-      const headerFor = (state) =>
-        React.createElement(
-          'div',
-          { className: 'dsh-tdfi-head' },
-          React.createElement(FileTypeIcon, { path: state.absolutePath, size: 20 }),
-          React.createElement(PathLabel, { path: state.absolutePath, className: 'dsh-tdfi-path' }),
-          typeof state.line === 'number' ? React.createElement('span', { className: 'dsh-tdfi-meta' }, t('line', { line: state.line })) : null,
-          typeof state.bytes === 'number' && state.bytes > 0 ? React.createElement('span', { className: 'dsh-tdfi-meta' }, fileSizeText(state.bytes)) : null,
+        const normalized = util.normalizeTargetPath(destination)
+        const suffix = util.splitLineSuffix(normalized)
+        const line = options?.line ?? util.lineFromFragment(fragment) ?? suffix.line
+        const hit = await remote.resolveTarget(
+          { path: suffix.path, absolute: util.isAbsolutePath(suffix.path) },
+          [util.dirnameOf(tab.absolutePath)],
         )
-
-      const bodyFor = (state) => {
-        if (state.phase === 'loading') {
-          return React.createElement(
-            'div',
-            { className: 'dsh-tdfi-loading' },
-            React.createElement(StateDot, { state: 'ongoing' }),
-            React.createElement('span', null, t('loading')),
-          )
+        if (hit === null) {
+          showToast(t('unresolved', { path: suffix.path }))
+          return
         }
-        if (state.phase === 'error') {
-          return React.createElement('div', { className: 'dsh-tdfi-error' }, state.error ?? t('error'))
-        }
-        if (state.kind === 'markdown') {
-          return React.createElement(
-            React.Fragment,
-            null,
-            React.createElement(
-              'div',
-              { className: 'dsh-tdfi-md' },
-              React.createElement(
-                MarkdownDelegateProvider,
-                { openExternalLink, openFile: (path, options) => openLinkedFile(state, path, options) },
-                React.createElement(MarkdownText, { text: state.text ?? '', labels: markdownLabels(), pathImages: pathImagesFor(state) }),
-              ),
-            ),
-            state.truncated === true ? React.createElement('div', { className: 'dsh-tdfi-note' }, t('truncated')) : null,
-          )
-        }
-        if (state.kind === 'code') {
-          return React.createElement(
-            React.Fragment,
-            null,
-            React.createElement(
-              'div',
-              { className: 'dsh-tdfi-code' },
-              React.createElement(CodeBlock, {
-                code: state.text ?? '',
-                lang: state.language,
-                lineNumbers: true,
-                copyLabel: t('copy'),
-                copiedLabel: t('copied'),
-                toolbarLabels: codeToolbarLabels(),
-              }),
-            ),
-            state.truncated === true ? React.createElement('div', { className: 'dsh-tdfi-note' }, t('truncated')) : null,
-          )
-        }
-        if (state.kind === 'image') {
-          return React.createElement('div', { className: 'dsh-tdfi-image' }, React.createElement('img', { src: state.url, alt: state.fileName }))
-        }
-        if (state.kind === 'pdf') {
-          return React.createElement('iframe', { className: 'dsh-tdfi-frame', src: state.url, title: state.fileName })
-        }
-        if (state.kind === 'html') {
-          return React.createElement('iframe', { className: 'dsh-tdfi-frame', src: state.url, title: state.fileName, sandbox: '' })
-        }
-        const reasonKey = state.reason === 'office' ? 'unsupportedOffice' : state.reason === 'tooLarge' ? 'unsupportedTooLarge' : state.reason === 'readFailed' ? 'unsupportedReadFailed' : 'unsupportedBinary'
-        return React.createElement(
-          'div',
-          { className: 'dsh-tdfi-unsupported' },
-          React.createElement(FileTypeIcon, { path: state.absolutePath, size: 44 }),
-          React.createElement('div', null, t(reasonKey)),
-        )
+        await openHit(hit, line)
       }
 
-      const footerFor = (state) => {
-        const canFallback = state.phase === 'error' || (state.phase === 'ready' && (state.kind === 'unsupported' || state.origin === 'office'))
-        return React.createElement(
-          React.Fragment,
-          null,
-          canFallback ? React.createElement(Button, { variant: 'outline', onClick: () => openWindowFallback(state) }, t('openInWindow')) : null,
-          React.createElement(Button, { onClick: () => closeViewer() }, t('close')),
-        )
-      }
-
-      const scrollViewerToLine = (line) => {
-        if (typeof line !== 'number' || line < 1) return false
-        let content = null
+      // ── the harness's own document window (fallback) ──────────────────────
+      function readMounted() {
         try {
-          content = document.querySelector('.dsh-tdfi-content')
+          return ctx.sidebarRight?.mounted?.getSnapshot?.()
+        } catch {
+          return undefined
+        }
+      }
+
+      function selectSession(sessionId) {
+        const sessions = ctx.sessions
+        const select = sessions?.open ?? sessions?.select
+        if (typeof select !== 'function') return false
+        try {
+          select.call(sessions, sessionId)
+          return true
         } catch {
           return false
         }
-        if (content === null) return false
-        const nodes = content.querySelectorAll('[data-code-block-content] .line')
-        if (nodes.length === 0) return false
-        const target = nodes[Math.min(nodes.length, line) - 1]
-        if (target === undefined) return false
+      }
+
+      function dismissCanvasOverlay() {
         try {
-          target.scrollIntoView({ block: 'center' })
+          window.postMessage({ source: 'dsh-thoughtdag', type: 'td:close' }, window.location.origin)
+        } catch {
+          // no listener: nothing to dismiss
+        }
+      }
+
+      function openDocumentTab(sessionId, address) {
+        return new Promise((resolve) => {
+          const deadline = Date.now() + OPEN_TIMEOUT_MS
+          const attempt = () => {
+            if (readMounted() === sessionId) {
+              try {
+                ctx.sidebarRight.openResource(address)
+                resolve(true)
+                return
+              } catch {
+                // surface not adopted yet; retry on the next frame
+              }
+            }
+            if (Date.now() >= deadline) {
+              resolve(false)
+              return
+            }
+            requestAnimationFrame(attempt)
+          }
+          attempt()
+        })
+      }
+
+      async function openInWindow(tab) {
+        const { remote, util } = await hostApi()
+        let sessionId = remote.currentSessionId()
+        if (sessionId === undefined) {
+          sessionId = tab.sessionId
+          selectSession(sessionId)
+        }
+        try {
+          ctx.layout.selectPanel('conversation')
         } catch {
           try {
-            target.scrollIntoView()
+            ctx.layout.selectPanel(null)
           } catch {
-            return false
+            // the host keeps its layout
           }
         }
-        return true
+        const address = util.sessionFileAddress(sessionId, tab.absolutePath)
+        if (await openDocumentTab(sessionId, address)) return true
+        dismissCanvasOverlay()
+        return openDocumentTab(sessionId, address)
+      }
+
+      // ── canvas click bridge ───────────────────────────────────────────────
+      function handleCanvasClick(event, util, openTarget) {
+        if (event.defaultPrevented) return
+        if (typeof event.button === 'number' && event.button !== 0) return
+        const target = event.target
+        const element = target !== null && target !== undefined && target.nodeType === 1 ? target : target?.parentElement
+        const anchor =
+          element !== null && element !== undefined && typeof element.closest === 'function'
+            ? element.closest('a[href]')
+            : null
+        if (anchor === null || anchor === undefined) return
+        const classified = util.classifyHref(anchor.getAttribute('href') ?? '')
+        if (classified === null) return
+        event.preventDefault()
+        event.stopPropagation()
+        openTarget(classified)
+      }
+
+      function installFrameBridge(util, openTarget) {
+        let bound
+        let timer = 0
+
+        const unbind = () => {
+          if (bound === undefined) return
+          try {
+            bound.frame.removeEventListener('load', bound.onLoad)
+          } catch {
+            // frame gone
+          }
+          try {
+            bound.doc?.removeEventListener('click', bound.onClick, true)
+          } catch {
+            // document gone
+          }
+          bound = undefined
+        }
+
+        const bind = (frame) => {
+          if (bound !== undefined && bound.frame === frame) return
+          unbind()
+          const entry = { frame, doc: null, onClick: null, onLoad: null }
+          const attach = () => {
+            let doc = null
+            try {
+              doc = entry.frame.contentDocument
+            } catch {
+              doc = null
+            }
+            if (doc === null) return
+            if (entry.doc === doc) return
+            if (entry.doc !== null) {
+              try {
+                entry.doc.removeEventListener('click', entry.onClick, true)
+              } catch {
+                // replaced document
+              }
+            }
+            entry.doc = doc
+            try {
+              doc.addEventListener('click', entry.onClick, true)
+            } catch {
+              entry.doc = null
+            }
+          }
+          entry.onClick = (event) => handleCanvasClick(event, util, openTarget)
+          entry.onLoad = () => attach()
+          try {
+            frame.addEventListener('load', entry.onLoad)
+          } catch {
+            // detached frame
+          }
+          attach()
+          bound = entry
+        }
+
+        const find = () => {
+          const frame = document.querySelector('[data-dsh-thoughtdag] iframe')
+          if (frame === null) return
+          bind(frame)
+          if (bound !== undefined && bound.doc !== null && timer !== 0) {
+            clearInterval(timer)
+            timer = 0
+          }
+        }
+
+        find()
+        if (timer === 0) timer = setInterval(find, 1000)
+        return () => {
+          if (timer !== 0) clearInterval(timer)
+          timer = 0
+          unbind()
+        }
+      }
+
+      async function openCanvasTarget(classified) {
+        try {
+          const { remote } = await hostApi()
+          const hit = await remote.resolveTarget(classified, [])
+          if (hit === null) {
+            showToast(t('unresolved', { path: classified.path }))
+            return false
+          }
+          await openHit(hit, classified.line)
+          return true
+        } catch (error) {
+          console.warn('[dsh-thoughtdag-file-open] open failed:', error)
+          showToast(t('error'))
+          return false
+        }
+      }
+
+      // ── dialog chrome ─────────────────────────────────────────────────────
+      function renderActions(tab) {
+        if (tab === null) return null
+        const nodes = []
+        const editable = canEditTab(tab) && editingSupported
+        if (editable && tab.mode === 'preview') {
+          nodes.push(
+            React.createElement(
+              Button,
+              {
+                key: 'edit',
+                size: 'sm',
+                variant: 'outline',
+                icon: React.createElement(IconEditOutlineRegular, { size: 14 }),
+                onClick: () => setMode(tab.id, 'edit'),
+                title: t('hintEdit'),
+              },
+              t('edit'),
+            ),
+          )
+        }
+        if (tab.mode === 'edit') {
+          nodes.push(
+            React.createElement(Button, { key: 'cancel', size: 'sm', variant: 'ghost', onClick: () => setMode(tab.id, 'preview'), disabled: tab.saving === true }, t('cancel')),
+            React.createElement(
+              Button,
+              {
+                key: 'save',
+                size: 'sm',
+                variant: 'primary',
+                onClick: () => saveTab(tab.id),
+                disabled: tab.saving === true || tab.dirty !== true,
+                title: t('hintSave'),
+              },
+              tab.saving === true ? t('saving') : t('save'),
+            ),
+          )
+        }
+        nodes.push(
+          React.createElement(
+            'button',
+            {
+              key: 'window',
+              type: 'button',
+              className: 'dsh-tdfi-iconbtn',
+              title: t('openInWindow'),
+              'aria-label': t('openInWindow'),
+              onClick: () => {
+                openInWindow(tab).catch(() => showToast(t('error')))
+              },
+            },
+            React.createElement(IconRightUpOutlineRegular, { size: 15 }),
+          ),
+        )
+        nodes.push(React.createElement('span', { key: 'divider', className: 'dsh-tdfi-divider' }))
+        nodes.push(
+          React.createElement(
+            'button',
+            {
+              key: 'close',
+              type: 'button',
+              className: 'dsh-tdfi-iconbtn',
+              title: t('close'),
+              'aria-label': t('close'),
+              onClick: requestCloseDialog,
+            },
+            React.createElement(IconCloseOutlineRegular, { size: 15 }),
+          ),
+        )
+        return nodes
+      }
+
+      function renderMeta(tab) {
+        if (tab === null) return null
+        const children = [
+          React.createElement(PathLabel, { key: 'path', path: tab.absolutePath, className: 'dsh-tdfi-meta-path' }),
+        ]
+        if (typeof tab.line === 'number') {
+          children.push(React.createElement('span', { key: 'line', className: 'dsh-tdfi-pill' }, t('line', { line: tab.line })))
+        }
+        if (typeof tab.bytes === 'number' && tab.bytes > 0) {
+          children.push(React.createElement('span', { key: 'bytes', className: 'dsh-tdfi-pill' }, fileSizeText(tab.bytes)))
+        }
+        if (tab.truncated === true) {
+          children.push(React.createElement('span', { key: 'cut', className: 'dsh-tdfi-pill' }, t('truncated')))
+        }
+        return React.createElement('div', { className: 'dsh-tdfi-meta' }, children)
+      }
+
+      function renderFooter(tab) {
+        if (tab === null) return null
+        let dot = 'idle'
+        let label = t('previewMode')
+        if (tab.phase === 'loading') {
+          dot = 'ongoing'
+          label = t('loading')
+        } else if (tab.phase === 'error') {
+          dot = 'error'
+          label = t('error')
+        } else if (tab.saving === true) {
+          dot = 'ongoing'
+          label = t('saving')
+        } else if (tab.mode === 'edit') {
+          dot = tab.dirty === true ? 'warning' : 'idle'
+          label = tab.dirty === true ? t('unsaved') : t('saved')
+        }
+        let hint = ''
+        if (tab.phase === 'ready') {
+          if (tab.mode === 'edit') hint = t('hintSave')
+          else if (canEditTab(tab) && editingSupported) hint = t('hintEdit')
+        }
+        return React.createElement(
+          'div',
+          { className: 'dsh-tdfi-foot' },
+          React.createElement(
+            'div',
+            { className: 'dsh-tdfi-state' },
+            React.createElement(StateDot, { state: dot }),
+            React.createElement('span', { className: 'dsh-tdfi-state-label' }, label),
+          ),
+          hint === '' ? null : React.createElement('div', { className: 'dsh-tdfi-hint' }, hint),
+        )
+      }
+
+      function renderBody(tab, bodyRef) {
+        if (tab === null) return null
+        const children = []
+        if (tab.conflict === true) {
+          children.push(
+            React.createElement(
+              'div',
+              { key: 'conflict', className: 'dsh-tdfi-banner' },
+              React.createElement('span', { className: 'dsh-tdfi-banner-text' }, t('conflict')),
+              React.createElement(
+                'span',
+                { className: 'dsh-tdfi-banner-actions' },
+                React.createElement(
+                  Button,
+                  {
+                    size: 'sm',
+                    variant: 'outline',
+                    onClick: () => {
+                      reloadTab(tab.id)
+                    },
+                  },
+                  t('conflictReload'),
+                ),
+                React.createElement(
+                  Button,
+                  {
+                    size: 'sm',
+                    variant: 'primary',
+                    onClick: () => {
+                      saveTab(tab.id, { force: true })
+                    },
+                    disabled: tab.saving === true,
+                  },
+                  t('conflictForce'),
+                ),
+              ),
+            ),
+          )
+        }
+        if (tab.mode === 'edit') {
+          children.push(
+            React.createElement(components().Editor, {
+              key: `${tab.id}:edit`,
+              // Mount content keeps an unsaved draft when the tab is revisited;
+              // `text` is only the externally loaded content (a conflict reload
+              // replaces the document), so drafts never echo back down.
+              initialText:
+                typeof tab.draft === 'string' ? tab.draft : (typeof tab.text === 'string' ? tab.text : (tab.savedText ?? '')),
+              text: typeof tab.text === 'string' ? tab.text : (tab.savedText ?? ''),
+              savedText: typeof tab.savedText === 'string' ? tab.savedText : '',
+              path: tab.absolutePath,
+              initialLine: tab.line,
+              onDraft: (value) => setDraft(tab.id, value),
+              onDirtyChange: (dirty) => patchTab(tab.id, { editorDirty: dirty === true }),
+              onReady: editorReady,
+              onMode: (mode, detail) => {
+                editorInfo = { mode, detail }
+              },
+            }),
+          )
+        } else {
+          children.push(
+            React.createElement(components().PreviewBody, {
+              key: tab.id,
+              tab,
+              onOpenLinkedFile: openLinkedFile,
+              onOpenInWindow: () => {
+                openInWindow(tab).catch(() => showToast(t('error')))
+              },
+            }),
+          )
+        }
+        return React.createElement('div', { className: 'dsh-tdfi-body', ref: bodyRef }, children)
+      }
+
+      function renderConfirm(confirm) {
+        if (confirm === null) return null
+        const active = findTab(confirm.tabId)
+        const canSave = confirm.kind !== 'cancelEdit' && active !== null && active.mode === 'edit'
+        return React.createElement(components().ConfirmOverlay, {
+          confirm,
+          t,
+          busy: active !== null && active.saving === true,
+          onCancel: cancelConfirm,
+          onDiscard: discardConfirm,
+          onSave: canSave ? saveConfirm : undefined,
+        })
+      }
+
+      function handleDialogKeys(event) {
+        const current = activeTab()
+        const modifier = event.metaKey || event.ctrlKey
+        if (modifier && (event.key === 's' || event.key === 'S')) {
+          event.preventDefault()
+          event.stopPropagation()
+          if (current !== null && current.mode === 'edit') saveTab(current.id)
+          return
+        }
+        if (modifier && (event.key === 'e' || event.key === 'E')) {
+          event.preventDefault()
+          event.stopPropagation()
+          if (current !== null) setMode(current.id, current.mode === 'edit' ? 'preview' : 'edit')
+          return
+        }
+        if (event.key === 'Escape' && view.confirm !== null) {
+          event.preventDefault()
+          event.stopPropagation()
+          setView({ confirm: null })
+        }
       }
 
       const Viewer = () => {
-        const state = React.useSyncExternalStore(subscribeViewer, getViewer)
-        const targetLine = state !== null && typeof state === 'object' ? state.line : undefined
-        const text = state !== null && typeof state === 'object' ? state.text : undefined
-        const phase = state !== null && typeof state === 'object' ? state.phase : undefined
-        // The code viewer highlights asynchronously (its grammar arrives after
-        // the first paint), so retry the jump while that DOM settles.
+        const current = React.useSyncExternalStore(subscribeView, getView)
+        const active = current.tabs.find((tab) => tab.id === current.activeId) ?? null
+        const bodyRef = React.useRef(null)
+        const targetLine = active === null ? undefined : active.line
+        const targetText = active === null ? undefined : active.text
+        const targetPhase = active === null ? undefined : active.phase
+        const targetMode = active === null ? undefined : active.mode
+        const targetKind = active === null ? undefined : active.kind
+
+        // The code view highlights asynchronously; retry the jump while the DOM settles.
         React.useEffect(() => {
-          if (typeof targetLine !== 'number') return undefined
-          const timers = [0, 160, 480, 1000, 1800].map((delay) => setTimeout(() => { scrollViewerToLine(targetLine) }, delay))
+          if (typeof targetLine !== 'number' || targetMode !== 'preview' || targetKind !== 'code') return undefined
+          const scroll = components().scrollTexture
+          const timers = LINE_SCROLL_DELAYS.map((delay) =>
+            setTimeout(() => {
+              scroll(bodyRef.current, targetLine)
+            }, delay),
+          )
           return () => {
             for (const id of timers) clearTimeout(id)
           }
-        }, [targetLine, text, phase])
-        if (state === null) return null
+        }, [targetLine, targetText, targetPhase, targetMode, targetKind])
+
+        if (current.tabs.length === 0 || chunks === null) return null
         return React.createElement(
           Modal,
           {
             open: true,
-            onClose: () => closeViewer(),
-            title: state.fileName,
-            closeLabel: t('close'),
+            headless: true,
+            onClose: requestCloseDialog,
+            title: active === null ? t('title') : active.fileName,
             className: 'dsh-tdfi-dialog',
-            contentClassName: 'dsh-tdfi-content',
-            footer: footerFor(state),
+            backdropBlur: false,
           },
-          headerFor(state),
-          bodyFor(state),
+          React.createElement(
+            'div',
+            { className: 'dsh-tdfi-shell', onKeyDownCapture: handleDialogKeys },
+            React.createElement(
+              'div',
+              { className: 'dsh-tdfi-head' },
+              React.createElement(components().TabStrip, {
+                tabs: current.tabs,
+                activeId: current.activeId,
+                onActivate: activateTab,
+                onClose: requestCloseTab,
+                t,
+              }),
+              React.createElement('div', { className: 'dsh-tdfi-actions' }, renderActions(active)),
+            ),
+            renderMeta(active),
+            renderBody(active, bodyRef),
+            renderFooter(active),
+            renderConfirm(current.confirm),
+          ),
         )
       }
 
@@ -1073,43 +1231,142 @@ window.__ModuleLoader__.load({
         })
       }
 
-      const Overlay = () => React.createElement(React.Fragment, null, React.createElement(Viewer), React.createElement(ToastHost))
-
-      ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: NS, order: 60, locale: NS }, Overlay))
-
-      const openCanvasTarget = async (target) => {
-        try {
-          const hit = await resolveTarget(ctx, target, [])
-          if (hit === null) {
-            showToast(t('unresolved', { path: target.path }))
-            return false
+      const Overlay = () => {
+        // Loading the chunks is asynchronous; re-render once they are in.
+        const [, bump] = React.useState(0)
+        React.useEffect(() => {
+          let live = true
+          ensureChunks()
+            .then(() => {
+              if (live) bump((value) => value + 1)
+            })
+            .catch((error) => {
+              console.warn('[dsh-thoughtdag-file-open] chunks failed to load:', error)
+            })
+          return () => {
+            live = false
           }
-          await openViewerFile(ctx, hit, target.line)
-          return true
-        } catch (error) {
-          console.warn('[dsh-thoughtdag-file-open] open failed:', error)
-          showToast(t('error'))
-          return false
-        }
+        }, [])
+        return React.createElement(React.Fragment, null, React.createElement(Viewer), React.createElement(ToastHost))
       }
 
-      ctx.effect(() => installFrameBridge(ctx, openCanvasTarget), 'dsh-thoughtdag-file-open: canvas links')
+      ctx.slots.inject('shell.overlay', () =>
+        ctx.slots.register({ name: 'shell.overlay', id: NS, order: 60, locale: NS }, Overlay),
+      )
 
-      // A small manual handle for verification from the page's devtools, e.g.
-      // `await __dshThoughtdagFileOpen.open('docs/product/status.md')`.
+      // ── stylesheet, owned by this plugin and removed with it ───────────────
+      ctx.effect(() => {
+        let style = null
+        let disposed = false
+        ensureChunks()
+          .then((loaded) => {
+            if (disposed) return
+            style = document.createElement('style')
+            style.setAttribute('data-plugin', NS)
+            style.textContent = loaded.styles.CSS
+            document.head.append(style)
+          })
+          .catch(() => {
+            // the viewer still works without custom chrome
+          })
+        return () => {
+          disposed = true
+          style?.remove()
+          style = null
+        }
+      }, 'dsh-thoughtdag-file-open: stylesheet')
+
+      // ── the canvas link bridge ────────────────────────────────────────────
+      ctx.effect(() => {
+        let unbind = null
+        let disposed = false
+        ensureChunks()
+          .then((loaded) => {
+            if (disposed) return
+            unbind = installFrameBridge(loaded.util, openCanvasTarget)
+          })
+          .catch(() => {
+            // a broken chunk load must not break the page
+          })
+        return () => {
+          disposed = true
+          unbind?.()
+          unbind = null
+        }
+      }, 'dsh-thoughtdag-file-open: canvas links')
+
+      // ── manual handle (verification and debugging from the page devtools) ──
       try {
         window.__dshThoughtdagFileOpen = {
-          version: VERSION,
+          version: '3.0.0',
           open(href) {
-            const classified = classifyHref(String(href))
-            return Promise.resolve(classified !== null ? openCanvasTarget(classified) : false)
+            return ensureChunks().then((loaded) => {
+              const classified = loaded.util.classifyHref(String(href))
+              return classified === null ? false : openCanvasTarget(classified)
+            })
           },
-          state: () => viewer.state,
-          close: () => closeViewer(),
+          async openAbsolute(path, options) {
+            const { remote } = await hostApi()
+            const snapshot = remote.sessionSnapshot()
+            const sessionId = options?.sessionId ?? snapshot.currentId
+            if (sessionId === undefined) return false
+            const hit = await remote.stat(sessionId, String(path))
+            if (hit === null) return false
+            await openHit(
+              { sessionId, absolutePath: typeof hit.absolutePath === 'string' ? hit.absolutePath : String(path) },
+              options?.line,
+            )
+            return true
+          },
+          state: () => view,
+          active: () => activeTab(),
+          tabs: () => view.tabs.map((tab) => ({
+            id: tab.id,
+            fileName: tab.fileName,
+            phase: tab.phase,
+            kind: tab.kind,
+            mode: tab.mode,
+            dirty: tab.dirty === true,
+            version: tab.version,
+            sessionId: tab.sessionId,
+          })),
+          edit: () => {
+            const tab = activeTab()
+            return tab === null ? Promise.resolve(false) : setMode(tab.id, 'edit')
+          },
+          preview: () => {
+            const tab = activeTab()
+            return tab === null ? Promise.resolve(false) : setMode(tab.id, 'preview')
+          },
+          draft: (text) => {
+            const tab = activeTab()
+            if (tab !== null) setDraft(tab.id, String(text))
+          },
+          closeTab: (id) => requestCloseTab(id),
+          close: () => requestCloseDialog(),
+          forceCloseAll: () => closeAllNow(),
+          save: () => {
+            const tab = activeTab()
+            return tab === null ? Promise.resolve(false) : saveTab(tab.id)
+          },
+          saveForce: () => {
+            const tab = activeTab()
+            return tab === null ? Promise.resolve(false) : saveTab(tab.id, { force: true })
+          },
+          confirmDiscard: () => discardConfirm(),
+          confirmSave: () => saveConfirm(),
+          confirmCancel: () => cancelConfirm(),
+          editingSupported: () => editingSupported,
+          editorDiagnostics: () => ({
+            ...editorInfo,
+            ...(editorApi?.diagnostics?.() ?? {}),
+          }),
+          chunksLoaded: () => chunks !== null,
+          ready: () => ensureChunks().then(() => true),
         }
         ctx.effect(
           () => () => {
-            closeViewer()
+            closeAllNow()
             try {
               delete window.__dshThoughtdagFileOpen
             } catch {

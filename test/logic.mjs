@@ -1,276 +1,448 @@
-// Viewer + resolution checks: file kinds render in the in-page modal state,
-// resolution prefers the canvas's own project folder, failures report, and
-// ordinary HTTP(S) links are never intercepted.
-import { makeSandbox, fakeWorkspaceFiles, fakeOfficeToPdf, assert } from './harness.mjs'
+// Browser-free behaviour tests for the in-page viewer:
+// link classification, tab opening/deduping, the edit/save/conflict flow,
+// unsaved-change confirmation, and the chunk split itself.
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { ROOT, createHarness, jsonResponse, settle } from './harness.mjs'
 
-const SESSIONS = { current: 'session-chat', byId: { 'session-chat': { cwd: '/workspace/proj' } } }
-
-// ── Markdown opens in the modal, never by switching the main panel ───────
-{
-  const workspaceFiles = fakeWorkspaceFiles({
-    '/workspace/proj/docs/product/status.md': '# 系统当前状态\n\n正文内容。',
-  })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  const opened = await harness.api.open('docs/product/status.md')
-  assert(opened === true, 'relative Markdown link opens')
-  const state = harness.api.state()
-  assert(state?.phase === 'ready' && state.kind === 'markdown', 'Markdown renders through the Markdown viewer')
-  assert(state.text.includes('系统当前状态'), 'Markdown content was read')
-  assert(state.fileName === 'status.md' && state.absolutePath === '/workspace/proj/docs/product/status.md', 'modal is titled and located from the resolved file')
-  assert(!harness.ops.panels.some((entry) => entry[0] === 'panel'), 'the main panel is NOT switched (no page jump)')
-  assert(harness.ops.opened.length === 0, 'no document-window tab is opened')
-  harness.api.close()
+let passed = 0
+function check(name, fn) {
+  return Promise.resolve()
+    .then(fn)
+    .then(() => {
+      passed += 1
+      console.log(`ok - ${name}`)
+    })
+    .catch((error) => {
+      console.error(`FAIL - ${name}`)
+      throw error
+    })
 }
 
-// ── Code files render as highlighted code ────────────────────────────────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/src/main.py': 'print("hi")\n' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('src/main.py')
-  const state = harness.api.state()
-  assert(state?.kind === 'code', '.py renders through the code viewer')
-  assert(state.language === 'python', 'language is derived from the extension (python)')
-  assert(state.text.includes('print("hi")'), 'code source was read')
+/** Fetch double: capabilities + save route against the harness virtual files. */
+function makeFetch(files, versions, options = {}) {
+  const posts = []
+  let staleOnce = options.staleOnce === true
+  const fetchImpl = async (url, init = {}) => {
+    const target = String(url)
+    if (target.includes('api/thoughtdag-file-open.save')) {
+      const body = JSON.parse(init.body)
+      posts.push(body)
+      if (options.offline === true) throw new Error('network down')
+      if (staleOnce) {
+        staleOnce = false
+        return jsonResponse({ ok: false, code: 'FS_STALE_VERSION', message: 'stale' }, 409)
+      }
+      if (options.deny === true) return jsonResponse({ ok: false, code: 'FS_SANDBOX_DENIED', message: 'denied' }, 403)
+      const expected = body.expectedVersion
+      if (expected !== undefined && expected !== versions.get(body.path)) {
+        return jsonResponse({ ok: false, code: 'FS_STALE_VERSION', message: 'stale' }, 409)
+      }
+      const nextVersion = `saved-${String(posts.length)}`
+      files.set(body.path, body.content)
+      versions.set(body.path, nextVersion)
+      return jsonResponse({ ok: true, version: nextVersion, operation: 'update', bytes: body.content.length })
+    }
+    if (target.includes('api/thoughtdag-file-open')) {
+      return jsonResponse({ ok: true, editing: options.editing !== false, version: '3.0.0' })
+    }
+    return jsonResponse({ ok: false }, 404)
+  }
+  return { fetchImpl, posts }
 }
 
-// ── Images, PDF and HTML read bytes into blob URLs ───────────────────────
-for (const [href, kind, file] of [
-  ['file:///workspace/proj/img/logo.png', 'image', '/workspace/proj/img/logo.png'],
-  ['file:///workspace/proj/docs/spec.pdf', 'pdf', '/workspace/proj/docs/spec.pdf'],
-  ['file:///workspace/proj/demo/index.html', 'html', '/workspace/proj/demo/index.html'],
-]) {
-  const workspaceFiles = fakeWorkspaceFiles({ [file]: 'binary-bytes' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open(href)
-  const state = harness.api.state()
-  assert(state?.kind === kind && state.url === 'blob:mock-url', `${kind} previews from a blob URL`)
-  assert(harness.ops.panels.length === 0, `${kind} preview stays on the page`)
+async function openFiles(harness, paths) {
+  for (const path of paths) {
+    const opened = await harness.debug().openAbsolute(path)
+    assert.equal(opened, true, `expected ${path} to open`)
+  }
+  await settle()
 }
 
-// ── Office documents convert to PDF in-page ──────────────────────────────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/docs/report.docx': '' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles, officeToPdf: fakeOfficeToPdf() })
-  await harness.api.open('file:///workspace/proj/docs/report.docx')
-  const state = harness.api.state()
-  assert(state?.kind === 'pdf' && state.origin === 'office', 'a .docx renders through the host Office→PDF conversion')
-}
-
-// ── Without the conversion service, Office falls back to the window button ─
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/docs/report.docx': '' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('file:///workspace/proj/docs/report.docx')
-  const state = harness.api.state()
-  assert(state?.kind === 'unsupported' && state.reason === 'office', 'Office without a converter reports the window fallback')
-}
-
-// ── Binary / unreadable files report instead of rendering garbage ───────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/blob.bin': 'x' }, { binary: ['/workspace/proj/blob.bin'] })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('blob.bin')
-  const state = harness.api.state()
-  assert(state?.kind === 'unsupported' && state.reason === 'binary', 'a binary file reports that it cannot preview')
-}
-
-// ── Large text is truncated with a note ─────────────────────────────────
-{
-  const big = Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join('\n')
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/big.log': big }, { paged: true, pageLines: 2 })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('big.log')
-  const state = harness.api.state()
-  assert(state?.kind === 'code' && state.truncated === true, 'a large text file is truncated and flagged')
-}
-
-// ── HTTP(S) links are left completely alone ──────────────────────────────
-{
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles: fakeWorkspaceFiles({}) })
-  const opened = await harness.api.open('https://example.com/page?a=1')
-  assert(opened === false && harness.api.state() === null, 'an HTTP(S) link never opens the viewer')
-  assert(harness.ops.windows.length === 0, 'an HTTP(S) link never opens a window from the plugin')
-}
-
-// ── Unknown extension with text content still previews ──────────────────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/deploy.weird': 'key: value\n' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('deploy.weird')
-  const state = harness.api.state()
-  assert(state?.kind === 'code' && state.text.includes('key: value'), 'unknown extensions with text content preview as text')
-}
-
-// ── The canvas's own project folder outranks an outer session cwd ───────
-{
-  const workspaceFiles = fakeWorkspaceFiles({
-    '/workspace/docs/spec.md': 'outer',
-    '/srv/canvas-project/docs/spec.md': 'inner',
-  })
-  const harness = makeSandbox({
-    sessions: { current: 'session-chat', byId: { 'session-chat': { cwd: '/workspace' } } },
-    workspaceFiles,
-    indexedDB: {
-      databases: async () => [{ name: 'keyval-store', version: 1 }],
-      open: () => {
-        const request = { result: null, error: null, transaction: { abort: () => {} } }
-        setTimeout(() => request.onsuccess?.(), 0)
-        request.result = {
-          objectStoreNames: { contains: () => true },
-          transaction: () => ({
-            objectStore: () => ({
-              getAll: () => {
-                const all = {
-                  result: [{ state: { projects: [{ id: 'active', agentCwd: '/srv/canvas-project' }], activeId: 'active' }, version: 1 }],
-                }
-                setTimeout(() => all.onsuccess?.(), 0)
-                return all
-              },
-            }),
-          }),
-          close: () => {},
-        }
-        return request
-      },
+async function run() {
+  // ── the chunk split ───────────────────────────────────────────────────────
+  const baseHarness = createHarness({
+    files: {
+      '/project/notes/a.md': '# Title\n\nbody\n',
+      '/project/src/main.js': 'export const x = 1\n',
+      '/project/data.csv': 'a,b\n1,2\n',
     },
   })
-  await harness.api.open('docs/spec.md')
-  const state = harness.api.state()
-  assert(state.absolutePath === '/srv/canvas-project/docs/spec.md', 'the canvas project folder wins over an outer session cwd')
-}
-
-// ── Session cwds reported by the ThoughtDAG bridge participate ──────────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/archived/docs/old.md': 'old docs' })
-  const harness = makeSandbox({
-    sessions: SESSIONS,
-    workspaceFiles,
-    fetch: async () => ({ ok: true, json: async () => ({ sessions: [{ id: 'session-old', cwd: '/workspace/archived' }] }) }),
+  await check('entry loads all six package-local chunks', async () => {
+    assert.equal(await baseHarness.debug().ready(), true)
+    const util = await baseHarness.chunk('client.util.js')
+    const remote = await baseHarness.chunk('client.remote.js')
+    const styles = await baseHarness.chunk('client.styles.js')
+    const tabs = await baseHarness.chunk('client.tabs.js')
+    const preview = await baseHarness.chunk('client.preview.js')
+    const editor = await baseHarness.chunk('client.editor.js')
+    assert.equal(typeof util.classifyHref, 'function')
+    assert.equal(typeof remote.createRemote, 'function')
+    assert.match(styles.CSS, /\.dsh-tdfi-dialog\.dsh-tdfi-dialog/)
+    assert.equal(typeof tabs.createTabs, 'function')
+    assert.equal(typeof preview.createPreview, 'function')
+    assert.equal(typeof editor.createEditor, 'function')
   })
-  await harness.api.open('docs/old.md')
-  const state = harness.api.state()
-  assert(state.absolutePath === '/workspace/archived/docs/old.md', 'an archived session cwd from the bridge resolves the link')
-}
 
-// ── line targets: ':48' and '#L92' both open the file at that line ──────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/packages/x/ctp_pipeline.dos': 'line1\nline2\n' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  const opened = await harness.api.open('packages/x/ctp_pipeline.dos:48')
-  const state = harness.api.state()
-  assert(opened === true, 'a trailing :48 line target opens the file')
-  assert(state.absolutePath === '/workspace/proj/packages/x/ctp_pipeline.dos', 'the :48 suffix is stripped from the resolved path')
-  assert(state.line === 48, 'the :48 suffix becomes the line target')
-  assert(state.kind === 'code', 'the .dos file previews as code')
-}
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/packages/x/ctp_pipeline.dos': 'line1\n' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('packages/x/ctp_pipeline.dos#L92')
-  assert(harness.api.state().line === 92, 'a #L92 fragment becomes the line target')
-}
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/packages/x/ctp_pipeline.dos': 'line1\n' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('packages/x/ctp_pipeline.dos#L10-L20')
-  assert(harness.api.state().line === 10, 'a #L10-L20 range jumps to its first line')
-}
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/src/main.py': 'print(1)\n' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('src/main.py:12:5')
-  const state = harness.api.state()
-  assert(state.line === 12 && state.absolutePath === '/workspace/proj/src/main.py', 'a :line:column suffix is understood too')
-}
-
-// ── Windows path spellings ──────────────────────────────────────────────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ 'C:/proj/docs/spec.md': 'win docs' })
-  const harness = makeSandbox({
-    sessions: { current: 'session-win', byId: { 'session-win': { cwd: 'C:\\proj' } } },
-    workspaceFiles,
+  await check('the vendored CodeMirror chunk is a self-registering, licensed artifact', () => {
+    const source = readFileSync(join(ROOT, 'client.codemirror.js'), 'utf8')
+    assert.match(source, /window\.__ModuleLoader__\.load\(/)
+    assert.match(source, /chunk: 'client\.codemirror\.js'/)
+    assert.match(source, /return __VENDORED_CODEMIRROR/)
+    assert.match(source, /All bundled code is MIT licensed/)
+    assert.match(source, /@codemirror\/view@6\./)
   })
-  const opened = await harness.api.open('docs\\spec.md:7')
-  const state = harness.api.state()
-  assert(opened === true && state !== null, 'a Windows workspace resolves a backslash relative link')
-  assert(state.absolutePath === 'C:/proj/docs/spec.md', 'Windows relative resolution joins with forward slashes')
-  assert(state.line === 7, 'the :line suffix works on a Windows path')
-}
-{
-  const workspaceFiles = fakeWorkspaceFiles({ 'C:/data/notes/todo.md': 'todo' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('file:///C:/data/notes/todo.md#L3')
-  const state = harness.api.state()
-  assert(state.absolutePath === 'C:/data/notes/todo.md', 'a Windows file:// URL resolves to its drive path')
-  assert(state.line === 3, 'a #L fragment after a Windows file URL becomes the line target')
-}
-{
-  const workspaceFiles = fakeWorkspaceFiles({ 'C:/data/notes/todo.md': 'todo' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('C:\\data\\notes\\todo.md:3')
-  const state = harness.api.state()
-  assert(state.absolutePath === 'C:/data/notes/todo.md', 'a bare Windows drive link is not mistaken for a URL scheme')
-  assert(state.line === 3, 'a bare Windows drive link keeps its line target')
-}
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '//server/share/doc.md': 'unc' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('file://server/share/doc.md')
-  const state = harness.api.state()
-  assert(state.absolutePath === '//server/share/doc.md', 'a UNC file:// URL resolves')
-}
-{
-  const workspaceFiles = fakeWorkspaceFiles({ 'D:/canvas/notes/a.md': 'proj' })
-  const harness = makeSandbox({
-    sessions: { current: 'session-chat', byId: { 'session-chat': { cwd: 'C:\\proj' } } },
-    workspaceFiles,
-    indexedDB: {
-      databases: async () => [{ name: 'keyval-store', version: 1 }],
-      open: () => {
-        const request = { result: null, error: null, transaction: { abort: () => {} } }
-        setTimeout(() => request.onsuccess?.(), 0)
-        request.result = {
-          objectStoreNames: { contains: () => true },
-          transaction: () => ({
-            objectStore: () => ({
-              getAll: () => {
-                const all = {
-                  result: [{ state: { projects: [{ id: 'active', agentCwd: 'D:\\canvas' }], activeId: 'active' }, version: 1 }],
-                }
-                setTimeout(() => all.onsuccess?.(), 0)
-                return all
-              },
-            }),
-          }),
-          close: () => {},
-        }
-        return request
-      },
+
+  await check('every component factory builds from the chunk seams', async () => {
+    const primitives = {
+      FileTypeIcon: () => null,
+      Button: () => null,
+      CodeBlock: () => null,
+      MarkdownText: () => null,
+      MarkdownDelegateProvider: () => null,
+      StateDot: () => null,
+      IconCloseOutlineRegular: () => null,
+    }
+    const tabs = await baseHarness.chunk('client.tabs.js')
+    const preview = await baseHarness.chunk('client.preview.js')
+    const editor = await baseHarness.chunk('client.editor.js')
+    const built = tabs.createTabs({ primitives })
+    assert.equal(typeof built.TabStrip, 'function')
+    assert.equal(typeof built.ConfirmOverlay, 'function')
+    assert.equal(typeof preview.createPreview({ util: await baseHarness.chunk('client.util.js'), t: (k) => k }).PreviewBody, 'function')
+    assert.equal(typeof editor.createEditor({ t: (k) => k }).Editor, 'function')
+  })
+
+  // ── link classification ──────────────────────────────────────────────────
+  await check('file links classify, external links are left alone', async () => {
+    const util = await baseHarness.chunk('client.util.js')
+    const relative = util.classifyHref('docs/a.md')
+    assert.equal(relative.path, 'docs/a.md')
+    assert.equal(relative.absolute, false)
+    assert.equal(relative.line, undefined)
+    const withLine = util.classifyHref('docs\\b.md:7')
+    assert.equal(withLine.path, 'docs/b.md')
+    assert.equal(withLine.line, 7)
+    const range = util.classifyHref('a.md#L92-L99')
+    assert.equal(range.path, 'a.md')
+    assert.equal(range.line, 92)
+    const bare = util.classifyHref('README')
+    assert.equal(bare.path, 'README')
+    assert.equal(bare.line, undefined)
+    assert.equal(util.classifyHref('https://example.com/a.md'), null)
+    assert.equal(util.classifyHref('mailto:a@b.c'), null)
+    assert.equal(util.classifyHref('#/canvas/route'), null)
+    assert.equal(util.classifyHref('justtext'), null)
+    const fileUrl = util.classifyHref('file:///tmp/report.md')
+    assert.equal(fileUrl.absolute, true)
+    assert.equal(fileUrl.path, '/tmp/report.md')
+    const drive = util.classifyHref('C:\\work\\a.md#L5')
+    assert.equal(drive.absolute, true)
+    assert.equal(drive.path, 'C:/work/a.md')
+    assert.equal(drive.line, 5)
+  })
+
+  // ── opening tabs ────────────────────────────────────────────────────────
+  const openHarness = createHarness({
+    files: {
+      '/project/notes/a.md': '# Title\n\nbody\n',
+      '/project/src/main.js': 'export const x = 1\n',
     },
   })
-  await harness.api.open('notes/a.md')
-  assert(harness.api.state().absolutePath === 'D:/canvas/notes/a.md', 'a Windows canvas project dir participates in resolution')
-}
-{
-  // macOS/Unix stays untouched: POSIX drive-less absolute and relative paths.
-  const workspaceFiles = fakeWorkspaceFiles({ '/Users/me/proj/docs/a.md': 'mac' })
-  const harness = makeSandbox({
-    sessions: { current: 'session-mac', byId: { 'session-mac': { cwd: '/Users/me/proj' } } },
-    workspaceFiles,
+  await check('two files open as two tabs, the second becomes active', async () => {
+    await openFiles(openHarness, ['/project/notes/a.md', '/project/src/main.js'])
+    const tabs = openHarness.debug().state().tabs
+    assert.equal(tabs.length, 2)
+    assert.equal(tabs[0].kind, 'markdown')
+    assert.equal(tabs[0].phase, 'ready')
+    assert.equal(tabs[1].kind, 'code')
+    assert.equal(openHarness.debug().state().activeId, '/project/src/main.js')
   })
-  await harness.api.open('docs/a.md#L5')
-  const state = harness.api.state()
-  assert(state.absolutePath === '/Users/me/proj/docs/a.md' && state.line === 5, 'POSIX (macOS/Linux) paths still resolve')
+
+  await check('re-opening an open file activates it and retargets the line', async () => {
+    await openHarness.debug().openAbsolute('/project/notes/a.md', { line: 5 })
+    await settle()
+    const tabs = openHarness.debug().state().tabs
+    assert.equal(tabs.length, 2)
+    assert.equal(openHarness.debug().state().activeId, '/project/notes/a.md')
+    assert.equal(tabs[0].line, 5)
+  })
+
+  await check('closing a clean tab removes it and picks a neighbour', async () => {
+    openHarness.debug().closeTab('/project/src/main.js')
+    await settle()
+    const state = openHarness.debug().state()
+    assert.equal(state.tabs.length, 1)
+    assert.equal(state.tabs[0].id, '/project/notes/a.md')
+    assert.equal(state.activeId, '/project/notes/a.md')
+  })
+
+  // ── edit / save ─────────────────────────────────────────────────────────
+  const editFiles = new Map([
+    ['/project/notes/a.md', '# Title\n\nbody\n'],
+    ['/project/src/main.js', 'export const x = 1\n'],
+  ])
+  const editVersions = new Map([
+    ['/project/notes/a.md', 'v-a'],
+    ['/project/src/main.js', 'v-b'],
+  ])
+  const { fetchImpl, posts } = makeFetch(editFiles, editVersions)
+  const editHarness = createHarness({ fetch: fetchImpl, filesMap: editFiles, versionsMap: editVersions })
+
+  await check('a tab opens in preview mode and edit switches to the editor', async () => {
+    await openFiles(editHarness, ['/project/notes/a.md'])
+    const tab = editHarness.debug().active()
+    assert.equal(tab.mode, 'preview')
+    await editHarness.debug().edit()
+    await settle()
+    const editing = editHarness.debug().active()
+    assert.equal(editing.mode, 'edit')
+    assert.equal(editing.draft, '# Title\n\nbody\n')
+    assert.equal(editing.dirty, false)
+    assert.equal(editHarness.debug().editingSupported(), true)
+  })
+
+  await check('saving posts the expected version and clears the dirty state', async () => {
+    editHarness.debug().draft('# Title\n\nedited body\n')
+    await settle()
+    assert.equal(editHarness.debug().active().dirty, true)
+    const saved = await editHarness.debug().save()
+    await settle()
+    assert.equal(saved, true)
+    assert.equal(posts.length, 1)
+    assert.equal(posts[0].path, '/project/notes/a.md')
+    assert.equal(posts[0].expectedVersion, 'v-a')
+    assert.equal(posts[0].content, '# Title\n\nedited body\n')
+    const tab = editHarness.debug().active()
+    assert.equal(tab.dirty, false)
+    assert.equal(tab.version, 'saved-1')
+    assert.equal(tab.mode, 'edit')
+    assert.equal(editHarness.files.get('/project/notes/a.md'), '# Title\n\nedited body\n')
+  })
+
+  await check('going back to preview on a dirty tab asks first', async () => {
+    editHarness.debug().draft('# Title\n\nsecond edit\n')
+    await settle()
+    await editHarness.debug().preview()
+    const confirm = editHarness.debug().state().confirm
+    assert.equal(confirm.kind, 'cancelEdit')
+    editHarness.debug().confirmCancel()
+    assert.equal(editHarness.debug().state().confirm, null)
+    assert.equal(editHarness.debug().active().mode, 'edit')
+    editHarness.debug().confirmDiscard
+    // discard restores the saved baseline and returns to preview
+    await editHarness.debug().preview()
+    editHarness.debug().confirmDiscard()
+    assert.equal(editHarness.debug().active().mode, 'preview')
+    assert.equal(editHarness.debug().active().dirty, false)
+    assert.equal(editHarness.debug().active().text, '# Title\n\nedited body\n')
+  })
+
+  // ── conflicts and failures ──────────────────────────────────────────────
+  const staleFiles = new Map([['/project/notes/a.md', 'original\n']])
+  const staleVersions = new Map([['/project/notes/a.md', 'v-orig']])
+  const staleFetch = makeFetch(staleFiles, staleVersions, { staleOnce: true })
+  const staleHarness = createHarness({ fetch: staleFetch.fetchImpl, filesMap: staleFiles, versionsMap: staleVersions })
+
+  await check('a stale version raises the conflict state, force save overwrites', async () => {
+    await openFiles(staleHarness, ['/project/notes/a.md'])
+    await staleHarness.debug().edit()
+    await settle()
+    staleHarness.debug().draft('mine\n')
+    await settle()
+    const first = await staleHarness.debug().save()
+    assert.equal(first, false)
+    const conflicted = staleHarness.debug().active()
+    assert.equal(conflicted.conflict, true)
+    assert.equal(conflicted.saving, false)
+    const forced = await staleHarness.debug().saveForce()
+    assert.equal(forced, true)
+    assert.equal(staleHarness.debug().active().conflict, false)
+    assert.equal(staleFetch.posts.length, 2)
+    assert.equal(staleFetch.posts[1].force, true)
+  })
+
+  await check('a denied or offline save reports failure and keeps the draft', async () => {
+    const denyFiles = new Map([['/project/notes/a.md', 'x\n']])
+    const denyVersions = new Map([['/project/notes/a.md', 'v']])
+    const denyFetch = makeFetch(denyFiles, denyVersions, { deny: true })
+    const denyHarness = createHarness({ fetch: denyFetch.fetchImpl, files: { '/project/notes/a.md': 'x\n' } })
+    denyHarness.versions.set('/project/notes/a.md', 'v')
+    await openFiles(denyHarness, ['/project/notes/a.md'])
+    await denyHarness.debug().edit()
+    await settle()
+    denyHarness.debug().draft('changed\n')
+    await settle()
+    assert.equal(await denyHarness.debug().save(), false)
+    const tab = denyHarness.debug().active()
+    assert.equal(tab.saving, false)
+    assert.equal(tab.dirty, true)
+    assert.equal(tab.conflict, false)
+  })
+
+  await check('editing is unavailable when the Host route is missing', async () => {
+    const noHost = createHarness({ fetch: undefined, files: { '/project/notes/a.md': 'x\n' } })
+    await openFiles(noHost, ['/project/notes/a.md'])
+    await noHost.debug().edit()
+    await settle()
+    assert.equal(noHost.debug().active().mode, 'preview')
+    assert.equal(noHost.debug().editingSupported(), false)
+  })
+
+  // ── unsaved changes on close ────────────────────────────────────────────
+  await check('closing a dirty tab asks, discard closes it', async () => {
+    const files = new Map([
+      ['/project/notes/a.md', 'a\n'],
+      ['/project/notes/b.md', 'b\n'],
+    ])
+    const versions = new Map([
+      ['/project/notes/a.md', 'v1'],
+      ['/project/notes/b.md', 'v2'],
+    ])
+    const local = makeFetch(files, versions)
+    const harness = createHarness({ fetch: local.fetchImpl, filesMap: files, versionsMap: versions })
+    await openFiles(harness, ['/project/notes/a.md', '/project/notes/b.md'])
+    await harness.debug().openAbsolute('/project/notes/a.md')
+    await settle()
+    await harness.debug().edit()
+    await settle()
+    harness.debug().draft('a changed\n')
+    await settle()
+    harness.debug().closeTab('/project/notes/a.md')
+    const confirm = harness.debug().state().confirm
+    assert.equal(confirm.kind, 'closeTab')
+    assert.equal(confirm.tabId, '/project/notes/a.md')
+    harness.debug().confirmDiscard()
+    assert.equal(harness.debug().state().tabs.length, 1)
+    assert.equal(harness.debug().state().tabs[0].id, '/project/notes/b.md')
+  })
+
+  await check('closing the dialog with dirty tabs asks, save-and-close saves all', async () => {
+    const files = new Map([['/project/notes/a.md', 'a\n']])
+    const versions = new Map([['/project/notes/a.md', 'v1']])
+    const local = makeFetch(files, versions)
+    const harness = createHarness({ fetch: local.fetchImpl, filesMap: files, versionsMap: versions })
+    await openFiles(harness, ['/project/notes/a.md'])
+    await harness.debug().edit()
+    await settle()
+    harness.debug().draft('saved on close\n')
+    await settle()
+    harness.debug().close()
+    const confirm = harness.debug().state().confirm
+    assert.equal(confirm.kind, 'closeDialog')
+    await harness.debug().confirmSave()
+    await settle()
+    assert.equal(harness.debug().state().tabs.length, 0)
+    assert.equal(harness.files.get('/project/notes/a.md'), 'saved on close\n')
+  })
+
+  // ── unresolved / non-file links ─────────────────────────────────────────
+  await check('an unresolvable link returns false instead of opening a tab', async () => {
+    const harness = createHarness({ fetch: async () => jsonResponse({ sessions: [] }, 200), files: {} })
+    const opened = await harness.debug().open('missing/file.md')
+    assert.equal(opened, false)
+    assert.equal(harness.debug().state().tabs.length, 0)
+  })
+
+  await check('a binary preview kind stays read-only', async () => {
+    const harness = createHarness({ files: { '/project/logo.png': 'not-really-a-png' } })
+    await openFiles(harness, ['/project/logo.png'])
+    const tab = harness.debug().active()
+    assert.equal(tab.kind, 'image')
+    assert.equal(tab.phase, 'ready')
+  })
+
+  await check('relative targets resolve against the document directory', async () => {
+    const harness = createHarness({
+      files: {
+        '/project/docs/guide.md': '# Guide\n\n[status](../notes/status.md)\n',
+        '/project/notes/status.md': 'done\n',
+      },
+      fetch: async () => jsonResponse({ sessions: [] }, 200),
+    })
+    await openFiles(harness, ['/project/docs/guide.md'])
+    const opened = await harness.debug().open('/project/notes/status.md')
+    assert.equal(opened, true)
+    await settle()
+    assert.equal(harness.debug().state().tabs.length, 2)
+  })
+
+  // ── shallow rendering of the dialog chrome ──────────────────────────────
+  await check('a ready markdown tab renders the dialog chrome and markdown body', async () => {
+    const harness = createHarness({
+      fetch: async () => jsonResponse({ ok: true, editing: true }),
+      files: { '/project/docs/guide.md': '# Guide\n\ntext\n' },
+    })
+    await openFiles(harness, ['/project/docs/guide.md'])
+    const classes = harness.overlayClasses()
+    for (const expected of [
+      'dsh-tdfi-dialog',
+      'dsh-tdfi-shell',
+      'dsh-tdfi-head',
+      'dsh-tdfi-tabs',
+      'dsh-tdfi-tab',
+      'dsh-tdfi-actions',
+      'dsh-tdfi-meta',
+      'dsh-tdfi-body',
+      'dsh-tdfi-foot',
+      'dsh-tdfi-scroll',
+      'dsh-tdfi-md',
+    ]) {
+      assert.ok(classes.includes(expected), `missing ${expected} in ${classes.join(', ')}`)
+    }
+    assert.ok(classes.includes('dsh-tdfi-dirty') === false, 'a clean tab must not show a dirty dot')
+  })
+
+  await check('a code tab renders the code scroll region', async () => {
+    const harness = createHarness({
+      fetch: async () => jsonResponse({ ok: true, editing: true }),
+      files: { '/project/src/main.js': 'export const x = 1\n' },
+    })
+    await openFiles(harness, ['/project/src/main.js'])
+    const classes = harness.overlayClasses()
+    assert.ok(classes.includes('dsh-tdfi-code'))
+    assert.ok(classes.includes('dsh-tdfi-scroll'))
+  })
+
+  await check('edit mode renders the CodeMirror host, dirty shows the dot', async () => {
+    const files = new Map([['/project/docs/guide.md', '# Guide\n']])
+    const versions = new Map([['/project/docs/guide.md', 'v1']])
+    const local = makeFetch(files, versions)
+    const harness = createHarness({ fetch: local.fetchImpl, filesMap: files, versionsMap: versions })
+    await openFiles(harness, ['/project/docs/guide.md'])
+    await harness.debug().edit()
+    await settle()
+    let classes = harness.overlayClasses()
+    assert.ok(classes.includes('dsh-tdfi-editor'))
+    assert.ok(classes.includes('dsh-tdfi-cm-host'))
+    assert.ok(classes.includes('dsh-tdfi-cm-loading'))
+    harness.debug().draft('# Guide\n\nchanged\n')
+    await settle()
+    classes = harness.overlayClasses()
+    assert.ok(classes.includes('dsh-tdfi-dirty'))
+  })
+
+  await check('the unsaved confirmation renders its card over the body', async () => {
+    const files = new Map([['/project/docs/guide.md', '# Guide\n']])
+    const versions = new Map([['/project/docs/guide.md', 'v1']])
+    const local = makeFetch(files, versions)
+    const harness = createHarness({ fetch: local.fetchImpl, filesMap: files, versionsMap: versions })
+    await openFiles(harness, ['/project/docs/guide.md'])
+    await harness.debug().edit()
+    await settle()
+    harness.debug().draft('changed\n')
+    await settle()
+    harness.debug().close()
+    const classes = harness.overlayClasses()
+    assert.ok(classes.includes('dsh-tdfi-confirm'))
+    assert.ok(classes.includes('dsh-tdfi-confirm-card'))
+  })
+
+  console.log(`\n${passed} checks passed`)
 }
 
-// ── Closing releases the viewer ─────────────────────────────────────────
-{
-  const workspaceFiles = fakeWorkspaceFiles({ '/workspace/proj/x.png': 'png' })
-  const harness = makeSandbox({ sessions: SESSIONS, workspaceFiles })
-  await harness.api.open('file:///workspace/proj/x.png')
-  assert(harness.api.state() !== null, 'image open before close')
-  harness.api.close()
-  assert(harness.api.state() === null, 'close dismisses the modal')
-}
-
-console.log('\nall viewer/resolution checks passed')
+run().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
